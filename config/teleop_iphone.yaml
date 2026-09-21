@@ -1,26 +1,29 @@
 teleop_iphone:
   ros__parameters:
-    # iPhone TF frames
+    # The OSC node broadcasts iphone_odom -> iphone. The MPC/SLAM world is
+    # the target frame consumed by go2_x5_planning.
     iphone_source_frame: "iphone_odom"
-    iphone_target_frame: "iphone_ros"
-    # Arm base frame (must match arx5_ros2's "base_frame" param; used as frame_id on outgoing EE commands)
-    arm_base_frame: "base_link"
+    iphone_target_frame: "iphone"
+    goal_frame: "world"
 
-    eef_cmd_topic: "/arx5_controller/eef_cmd"
-    gripper_cmd_topic: "/arx5_controller/gripper_cmd"
-    eef_state_topic: "/arx5_controller/eef_state"
-    reset_service_name: "/arx5_controller/reset_to_home"
+    # go2_x5_planning accepts this PoseStamped and publishes native
+    # ocs2_msgs/MpcTargetTrajectories for go2_x5_ocs2. The teleop node also
+    # publishes the native target directly for setups without the planner.
+    goal_topic: "/go2_x5/ee/goal"
+    mpc_target_topic: "/mobile_manipulator_mpc_target"
+    mpc_input_dim: 12
+    ee_state_topic: "/go2_x5/ee/state"
+    mode_topic: "/go2_x5/arm/mode/state"
+    touch_topic: "/iphone/touch"
 
-    # Touch radius threshold to detect pressing
+    # A touch is a clutch: press to capture phone and EE poses, move, release
+    # to stop. Three fingers disengage; release all fingers before re-clutching.
     touch_threshold: 0.3
-    touch_timeout: 0.05
+    touch_timeout: 0.20
+    pose_timeout: 0.20
+    ee_state_timeout: 0.50
 
-    # Scale factor for position mapping (iphone movement -> EE movement)
-    position_scale: 1.2
+    position_scale: 1.0
     rotation_scale: 0.6
-
-    # Gripper positions
-    gripper_open: 0.04 # 0.07
-    gripper_close: 0.005
-
-    control_rate: 60 # hz
+    phone_to_world_yaw: 0.0
+    control_rate: 50.0

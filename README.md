@@ -1,5 +1,7 @@
 # Teleop-iPhone
 
+The ROS2 package is adapted for the Go2-X5 OCS2 stack: iPhone motion is converted into world-frame EE goals for OCS2, with an optional `go2_x5_planning` bridge. OCS2 remains the only joint-command producer. The legacy sensor receiver topics are still available for diagnostics.
+
 This repository contains tools for receiving ARKit and sensor data from ZigSim Pro iOS app:
 
 1. **Python UDP/JSON Receiver** - Simple standalone script for testing
@@ -24,13 +26,14 @@ For ROS2 integration:
 
 ```bash
 # Quick setup and build
-./setup_ros2.sh
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select teleop_iphone --symlink-install
 
 # Source workspace
-source ~/ros2_ws/install/setup.bash
+source ros2_ws/install/setup.bash
 
 # Launch node
-ros2 launch teleop_iphone zigsim_osc.launch.py
+ros2 launch teleop_iphone teleop.launch.py
 ```
 
 Configure ZigSim Pro to send **JSON** data to your computer's IP on port **3333** (or your configured port).
@@ -95,7 +98,8 @@ Full-featured ROS2 node that receives OSC data and publishes to standard ROS2 to
 ### Quick Setup
 
 ```bash
-./setup_ros2.sh
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select teleop_iphone --symlink-install
 ```
 
 ### Published Topics
@@ -198,7 +202,6 @@ Change the port number in both the script and ZigSim Pro configuration.
 zigsim_tele/
 ├── receive_zigsim_data.py    # Python UDP/JSON receiver
 ├── test_osc_receiver.py      # OSC test script
-├── setup_ros2.sh             # ROS2 quick setup script
 ├── README.md                 # This file
 ├── ROS2_README.md           # Detailed ROS2 documentation
 ├── package.xml              # ROS2 package manifest
@@ -206,12 +209,42 @@ zigsim_tele/
 ├── src/
 │   └── osc_node.cpp  # ROS2 node source
 ├── launch/
-│   └── zigsim_osc.launch.py     # ROS2 launch file
+│   └── teleop.launch.py     # ROS2 launch file
 └── config/
-    └── zigsim_params.yaml       # ROS2 parameters
+    ├── osc_params.yaml          # UDP/OSC input and ARKit correction
+    └── teleop_iphone.yaml       # Go2-X5 OCS2 goal routing
 ```
 
 ---
+
+## Go2-X5 OCS2 teleoperation
+
+The ROS2 teleop node publishes end-effector goals for the existing Go2-X5 OCS2 graph. It does not publish joint, Cartesian-controller, gripper, or reset commands. It publishes both the planner-facing `PoseStamped` goal and the native OCS2 target topic, so the planner is optional for this teleop path.
+
+Start the MPC graph first. The launch below also starts the existing reference manager, although teleop can publish the native target directly:
+
+```bash
+# Terminal 1: start OCS2 and its EE reference manager.
+ros2 launch go2_x5_ocs2 go2_x5_ros_mpc.launch.py \
+  rviz:=false start_rviz:=false ee_reference_mode:=marker
+# Terminal 2: start the iPhone receiver and goal teleop node.
+ros2 launch teleop_iphone teleop.launch.py
+```
+
+Configure ZigSim Pro to send JSON/UDP to the host and port in `config/osc_params.yaml`. The receiver publishes the corrected phone pose as `iphone_odom -> iphone`. On a running OCS2/WBC mode, press one or two fingers to clutch the current EE pose, move the phone, and release to stop. Three fingers disengage; release all fingers before pressing again.
+
+The data path is:
+
+```text
+ZigSim Pro -> osc_node -> /iphone/touch + TF
+teleop_iphone -> /go2_x5/ee/goal (geometry_msgs/PoseStamped)
+teleop_iphone -> /mobile_manipulator_mpc_target (ocs2_msgs/MpcTargetTrajectories)
+go2_x5_planning -> /mobile_manipulator_mpc_target (when the planner is running)
+go2_x5_ocs2 -> /go2_x5/arm/command/request
+```
+
+`goal_frame` defaults to `world`, matching the OCS2 floating-base model. Set `phone_to_world_yaw` in `config/teleop_iphone.yaml` when the phone's ARKit horizontal axes are rotated relative to the SLAM world. The teleop node requires fresh `/go2_x5/ee/state` feedback and an `OCS2` or `WBC` arm mode before publishing goals.
+
 
 ## License
 

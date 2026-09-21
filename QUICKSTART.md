@@ -16,9 +16,10 @@ python receive_zigsim_data.py
 
 ### Method B: ROS2 (For Robotics)
 ```bash
-./setup_ros2.sh
-source ~/ros2_ws/install/setup.bash
-ros2 launch teleop_iphone zigsim_osc.launch.py
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select teleop_iphone --symlink-install
+source ros2_ws/install/setup.bash
+ros2 launch teleop_iphone teleop.launch.py
 ```
 - Configure ZigSim Pro: **JSON**, IP: `192.168.1.11`, Port: `3333`
 
@@ -73,11 +74,11 @@ You should see OSC messages with their addresses and values.
 ### "Port already in use"?
 - Change port in both script and ZigSim Pro
 - Python: `python receive_zigsim_data.py -p 9000`
-- ROS2: `ros2 launch teleop_iphone zigsim_osc.launch.py port:=9000`
+- ROS2: `ros2 launch teleop_iphone teleop.launch.py port:=9000`
 
 ### "ROS2 not found"?
-- Source ROS2 first: `source /opt/ros/humble/setup.bash`
-- Then run setup script: `./setup_ros2.sh`
+- Source Jazzy first: `source /opt/ros/jazzy/setup.bash`
+- Build and source the workspace: `colcon build --packages-select teleop_iphone --symlink-install && source ros2_ws/install/setup.bash`
 
 ## Port Reference
 

@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.8)
 project(teleop_iphone)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -14,7 +17,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2 REQUIRED)
-find_package(std_srvs REQUIRED)
+find_package(ocs2_msgs REQUIRED)
 
 # Include directories
 include_directories(
@@ -33,6 +36,7 @@ ament_target_dependencies(osc_node
   geometry_msgs
   nav_msgs
   tf2_ros
+  tf2
 )
 
 target_link_libraries(osc_node
@@ -50,7 +54,7 @@ ament_target_dependencies(teleop_iphone
   geometry_msgs
   tf2_ros
   tf2
-  std_srvs
+  ocs2_msgs
 )
 
 # Install targets
@@ -79,8 +83,11 @@ install(DIRECTORY
 )
 
 if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  ament_lint_auto_find_test_dependencies()
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(teleop_mpc test/test_teleop_mpc.py TIMEOUT 90
+    APPEND_ENV TELEOP_TEST_BIN_DIR=$<TARGET_FILE_DIR:teleop_iphone>)
 endif()
+
+install(FILES README.md DESTINATION share/${PROJECT_NAME})
 
 ament_package()

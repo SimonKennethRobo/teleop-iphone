@@ -1,6 +1,8 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <cmath>
+#include <stdexcept>
 
 #include <atomic>
 #include <iomanip>
@@ -9,6 +11,7 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -148,6 +151,14 @@ class OSCNode : public rclcpp::Node {
             correction_matrix_.getRotation(correction_quaternion_);
             RCLCPP_WARN(this->get_logger(), "Invalid correction_matrix rows, using default");
         }
+        // tf2 rejects NaN/denormalized rotations.  Validate the configured
+        // correction once so a malformed parameter cannot poison every TF.
+        if (!valid_quaternion(correction_quaternion_)) {
+            correction_quaternion_.setValue(0.0, 0.0, 0.0, 1.0);
+            RCLCPP_WARN(this->get_logger(), "Invalid correction rotation, using identity");
+        } else {
+            correction_quaternion_.normalize();
+        }
 
         // Create publishers
         imu_pub_        = this->create_publisher<sensor_msgs::msg::Imu>("iphone/imu", 10);
@@ -169,7 +180,7 @@ class OSCNode : public rclcpp::Node {
             receiver_thread_ = std::thread(&OSCNode::receive_loop, this);
             RCLCPP_INFO(this->get_logger(), "ZigSim OSC Receiver started on %s:%d", host_.c_str(), port_);
         } else {
-            RCLCPP_ERROR(this->get_logger(), "Failed to initialize socket");
+            throw std::runtime_error("Failed to initialize UDP socket");
         }
     }
 
@@ -202,7 +213,19 @@ class OSCNode : public rclcpp::Node {
         std::memset(&addr, 0, sizeof(addr));
         addr.sin_family      = AF_INET;
         addr.sin_port        = htons(port_);
-        addr.sin_addr.s_addr = INADDR_ANY;
+        if (port_ < 1 || port_ > 65535 || inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+            RCLCPP_ERROR(this->get_logger(), "Invalid UDP host or port");
+            close(sockfd_);
+            sockfd_ = -1;
+            return false;
+        }
+        // Bound recvfrom so shutdown can join even when the phone is silent.
+        timeval timeout{0, 100000};
+        if (setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+            close(sockfd_);
+            sockfd_ = -1;
+            return false;
+        }
 
         if (bind(sockfd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to bind socket to port %d", port_);
@@ -244,7 +267,7 @@ class OSCNode : public rclcpp::Node {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                          "Unknown data format (first byte: 0x%02x)", (unsigned char)buffer[0]);
                 }
-            } else if (n < 0 && running_) {
+            } else if (n < 0 && running_ && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 RCLCPP_ERROR(this->get_logger(), "recvfrom error: %s", strerror(errno));
             }
         }
@@ -347,7 +370,7 @@ class OSCNode : public rclcpp::Node {
                 bool has_position =
                     arkit.contains("position") && arkit["position"].is_array() && arkit["position"].size() >= 3;
 
-                if (has_rotation || has_position) {
+                if (has_rotation && has_position) {
                     publish_arkit_pose_json(arkit, now);
                 }
             }
@@ -519,14 +542,13 @@ class OSCNode : public rclcpp::Node {
     }
 
     void publish_compass_json(const json& compass, rclcpp::Time stamp) {
+        (void)stamp;
         auto compass_msg = std_msgs::msg::Float64();
         compass_msg.data = compass["compass"].get<double>();
         compass_pub_->publish(compass_msg);
     }
 
     void publish_touch_json(const json& touches, rclcpp::Time stamp) {
-        if (touches.empty()) return;
-
         // Publish all touch points using PoseArray
         // Each pose: position.x = touch x, position.y = touch y, position.z = force
         // orientation.w = radius (other orientation components = 0)
@@ -577,6 +599,14 @@ class OSCNode : public rclcpp::Node {
             qw       = rot[3].get<double>();
         }
 
+        const double norm = std::sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
+        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) ||
+            !std::isfinite(norm) || norm < 1e-6) return;
+        qx /= norm;
+        qy /= norm;
+        qz /= norm;
+        qw /= norm;
+
         // Publish raw ARKit pose
         pose_msg.pose.position.x    = px;
         pose_msg.pose.position.y    = py;
@@ -600,6 +630,14 @@ class OSCNode : public rclcpp::Node {
             tf2::Quaternion q_arkit(qx, qy, qz, qw);
             tf2::Quaternion q_ros = correction_quaternion_ * q_arkit;
 
+            if (!std::isfinite(p_ros.x()) || !std::isfinite(p_ros.y()) || !std::isfinite(p_ros.z()) ||
+                !valid_quaternion(q_ros)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Skipping ARKit TF with invalid corrected pose");
+                return;
+            }
+            q_ros.normalize();
+
             tf_msg.child_frame_id          = frame_id_;
             tf_msg.transform.translation.x = p_ros.x();
             tf_msg.transform.translation.y = p_ros.y();
@@ -621,6 +659,12 @@ class OSCNode : public rclcpp::Node {
             tf_msg.transform.rotation.w    = qw;
         }
         tf_broadcaster_->sendTransform(tf_msg);
+    }
+
+    static bool valid_quaternion(const tf2::Quaternion& q) {
+        const double norm = q.length2();
+        return std::isfinite(q.x()) && std::isfinite(q.y()) && std::isfinite(q.z()) && std::isfinite(q.w()) &&
+               std::isfinite(norm) && norm > 1e-12;
     }
 
     // OSC-based publish functions
