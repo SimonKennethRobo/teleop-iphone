@@ -37,7 +37,7 @@ class TeleopIphone : public rclcpp::Node {
     ee_timeout_ = positive_parameter("ee_state_timeout", 0.5);
     position_scale_ = declare_parameter<double>("position_scale", 1.0);
     rotation_scale_ = declare_parameter<double>("rotation_scale", 0.6);
-    const double yaw = declare_parameter<double>("phone_to_world_yaw", 0.0);
+    const double yaw = declare_parameter<double>("phone_to_world_yaw", 1.5707963267948966);
     const double rate = positive_parameter("control_rate", 50.0);
     if (!std::isfinite(touch_threshold_) || touch_threshold_ < 0.0 ||
         !std::isfinite(position_scale_) || position_scale_ < 0.0 ||

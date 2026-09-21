@@ -25,5 +25,7 @@ teleop_iphone:
 
     position_scale: 1.0
     rotation_scale: 0.6
-    phone_to_world_yaw: 0.0
+    # Align the phone's corrected horizontal axes with the Go2-X5 world axes:
+    # phone forward -> robot forward, phone left -> robot left.
+    phone_to_world_yaw: 1.5707963267948966
     control_rate: 50.0

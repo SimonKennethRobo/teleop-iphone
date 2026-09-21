@@ -14,6 +14,7 @@ def test_teleop_uses_native_ee_goal_contract():
     assert '"/go2_x5/ee/goal"' in config
     assert '"/go2_x5/ee/state"' in config
     assert '"/mobile_manipulator_mpc_target"' in config
+    assert "phone_to_world_yaw: 1.5707963267948966" in config
     assert "/arx5_controller" not in source
     assert "reset_to_home" not in source
     assert "Arx5Client" not in zmq
