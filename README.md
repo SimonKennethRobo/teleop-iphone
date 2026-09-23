@@ -231,7 +231,7 @@ ros2 launch go2_x5_ocs2 go2_x5_ros_mpc.launch.py \
 ros2 launch teleop_iphone teleop.launch.py
 ```
 
-Configure ZigSim Pro to send JSON/UDP to the host and port in `config/osc_params.yaml`. The receiver publishes the corrected phone pose as `iphone_odom -> iphone`. On a running OCS2/WBC mode, press one or two fingers to clutch the current EE pose, move the phone, and release to stop. Three fingers disengage; release all fingers before pressing again.
+Configure ZigSim Pro to send JSON/UDP to the host and port in `config/osc_params.yaml`. The receiver publishes the corrected phone pose as `iphone_odom -> iphone`. On a running OCS2/WBC mode, press one or two fingers to clutch the current EE pose, move the phone, and release to stop. Tracking continues with two fingers, which also open the gripper via `/go2_x5/arm/gripper/command`; going back to one finger closes it. Three fingers publish `HOME` to `/go2_x5/arm/mode/request`; the gesture fires once and rearms after all fingers are released.
 
 The data path is:
 

@@ -9,6 +9,7 @@
 #include <ocs2_msgs/msg/mpc_observation.hpp>
 #include <ocs2_msgs/msg/mpc_target_trajectories.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
@@ -30,6 +31,18 @@ class TeleopIphone : public rclcpp::Node {
     if (mpc_input_dim_ <= 0) throw std::invalid_argument("mpc_input_dim must be positive");
     const auto ee_topic = declare_parameter<std::string>("ee_state_topic", "/go2_x5/ee/state");
     const auto mode_topic = declare_parameter<std::string>("mode_topic", "/go2_x5/arm/mode/state");
+    const auto mode_request_topic = declare_parameter<std::string>(
+        "mode_request_topic", "/go2_x5/arm/mode/request");
+    home_mode_ = declare_parameter<std::string>("home_mode", "HOME");
+    if (home_mode_.empty()) throw std::invalid_argument("home_mode must not be empty");
+    const auto gripper_topic = declare_parameter<std::string>(
+        "gripper_command_topic", "/go2_x5/arm/gripper/command");
+    gripper_open_width_ = declare_parameter<double>("gripper_open_width", 0.088);
+    gripper_closed_width_ = declare_parameter<double>("gripper_closed_width", 0.0);
+    if (!std::isfinite(gripper_open_width_) || !std::isfinite(gripper_closed_width_) ||
+        gripper_closed_width_ < 0.0 || gripper_open_width_ <= gripper_closed_width_) {
+      throw std::invalid_argument("Gripper widths must be finite with 0 <= closed < open");
+    }
     const auto touch_topic = declare_parameter<std::string>("touch_topic", "/iphone/touch");
     touch_threshold_ = declare_parameter<double>("touch_threshold", 0.3);
     touch_timeout_ = positive_parameter("touch_timeout", 0.2);
@@ -50,20 +63,38 @@ class TeleopIphone : public rclcpp::Node {
     goal_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(goal_topic, rclcpp::QoS(1));
     mpc_target_pub_ = create_publisher<ocs2_msgs::msg::MpcTargetTrajectories>(
         mpc_target_topic, rclcpp::QoS(1).transient_local());
+    mode_request_pub_ = create_publisher<std_msgs::msg::String>(mode_request_topic, rclcpp::QoS(10));
+    gripper_pub_ = create_publisher<std_msgs::msg::Float64>(gripper_topic, rclcpp::QoS(10));
     touch_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
         touch_topic, rclcpp::SensorDataQoS().keep_last(1),
         [this](geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
           touch_count_ = 0;
+          touch_radii_.clear();
           for (const auto& pose : msg->poses) {
             if (std::isfinite(pose.orientation.w) && pose.orientation.w > touch_threshold_) ++touch_count_;
+            touch_radii_ += (touch_radii_.empty() ? "" : ",") + std::to_string(pose.orientation.w).substr(0, 5);
           }
           last_touch_ = Clock::now();
           have_touch_ = true;
           RCLCPP_INFO_ONCE(get_logger(), "Received iPhone touch input");
+          if (touch_count_ >= 3) {
+            disengage("three-finger gesture");
+            if (!home_gesture_latched_) {
+              std_msgs::msg::String request;
+              request.data = home_mode_;
+              mode_request_pub_->publish(request);
+              home_gesture_latched_ = true;
+              RCLCPP_WARN(get_logger(), "Three-finger gesture: requesting arm mode %s", home_mode_.c_str());
+            }
+          }
+          // One or two fingers both keep the clutch; two fingers additionally
+          // hold the gripper open and returning to one finger closes it.
+          if (touch_count_ == 1 || touch_count_ == 2) command_gripper(touch_count_ == 2);
           // Observe an explicit release before enabling/re-enabling the clutch.
           if (touch_count_ == 0) {
             pressing_ = false;
             release_required_ = false;
+            home_gesture_latched_ = false;
           }
         });
     ee_sub_ = create_subscription<ocs2_msgs::msg::MpcObservation>(
@@ -72,17 +103,17 @@ class TeleopIphone : public rclcpp::Node {
           const auto& value = msg->state.value;
           if (value.size() != 7 || msg->mode == 0 || !std::isfinite(msg->time)) {
             have_ee_ = false;
-            disengage();
+            disengage("invalid MPC observation");
             return;
           }
           tf2::Vector3 position(value[0], value[1], value[2]);
           tf2::Quaternion orientation(value[3], value[4], value[5], value[6]);
           if (!valid_pose(position, orientation)) {
             have_ee_ = false;
-            disengage();
+            disengage("invalid MPC EE pose");
             return;
           }
-          if (have_ee_ && msg->time < last_mpc_time_) disengage();
+          if (have_ee_ && msg->time < last_mpc_time_) disengage("MPC time went backwards");
           ee_position_ = position;
           ee_orientation_ = orientation.normalized();
           if (!msg->input.value.empty()) {
@@ -101,8 +132,9 @@ class TeleopIphone : public rclcpp::Node {
           // mode transition, otherwise the first active touch is blocked
           // until the phone happens to emit an empty release frame.
           if (!mode_.empty() && msg->data != mode_) {
-            disengage();
+            disengage("arm mode changed");
             have_ee_ = false;  // Require feedback from the new controller mode.
+            gripper_state_ = GripperState::Unknown;  // HOME/HOLD may move the gripper.
           }
           if (msg->data != mode_) RCLCPP_INFO(get_logger(), "Arm mode is %s", msg->data.c_str());
           mode_ = msg->data;
@@ -117,6 +149,7 @@ class TeleopIphone : public rclcpp::Node {
 
  private:
   using Clock = std::chrono::steady_clock;
+  enum class GripperState { Unknown, Open, Closed };
 
   double positive_parameter(const std::string& name, double default_value) {
     const double value = declare_parameter<double>(name, default_value);
@@ -130,9 +163,27 @@ class TeleopIphone : public rclcpp::Node {
            std::isfinite(q.w()) && std::isfinite(q.length2()) && q.length2() > 1e-12;
   }
 
-  void disengage() {
+  // Any disengage while fingers are down requires a full release. Log the
+  // reason once per interrupted clutch so dropouts can be diagnosed.
+  void disengage(const char* reason) {
+    if (pressing_) {
+      RCLCPP_WARN(get_logger(), "Tracking interrupted: %s (fingers=%zu, radii=[%s]); release to re-clutch",
+                  reason, touch_count_, touch_radii_.c_str());
+    }
     pressing_ = false;
     release_required_ = true;
+  }
+
+  void command_gripper(bool open) {
+    if (mode_ != "OCS2" && mode_ != "WBC") return;
+    const auto state = open ? GripperState::Open : GripperState::Closed;
+    // Send edges only; the driver keeps the last width.
+    if (state == gripper_state_) return;
+    std_msgs::msg::Float64 command;
+    command.data = open ? gripper_open_width_ : gripper_closed_width_;
+    gripper_pub_->publish(command);
+    gripper_state_ = state;
+    RCLCPP_INFO(get_logger(), "Gripper %s (%.3f m)", open ? "open" : "close", command.data);
   }
 
   void control() {
@@ -143,28 +194,28 @@ class TeleopIphone : public rclcpp::Node {
       return;
     }
     if (mode_ != "OCS2" && mode_ != "WBC") {
-      disengage();
+      disengage("arm mode is not OCS2/WBC");
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "Not publishing EE target: arm mode is '%s'", mode_.c_str());
       return;
     }
     if (!have_touch_ || std::chrono::duration<double>(wall - last_touch_).count() > touch_timeout_) {
-      disengage();
+      disengage("touch input timed out");
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "Not publishing EE target: waiting for fresh iPhone touch input");
       return;
     }
     if (touch_count_ == 0) return;
-    // Three or more fingers disengage until all fingers are lifted. No home or
-    // gripper commands bypass the MPC through the legacy arm controller.
-    if (touch_count_ >= 3) disengage();
+    // Two fingers keep tracking (gripper opened in the touch callback). Three
+    // or more fingers request HOME and disengage until all fingers are lifted.
+    if (touch_count_ >= 3) disengage("three-finger gesture");
     if (release_required_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "Not publishing EE target: release touch before re-clutching");
       return;
     }
     if (!have_ee_ || std::chrono::duration<double>(wall - last_ee_).count() > ee_timeout_) {
-      disengage();
+      disengage("MPC EE feedback timed out");
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for fresh MPC EE feedback; release to re-clutch");
       return;
     }
@@ -177,7 +228,7 @@ class TeleopIphone : public rclcpp::Node {
       const double age = (now() - stamp).seconds();
       // A cached TF must not masquerade as a new phone sample.
       if (age < 0.0 || age > pose_timeout_) {
-        disengage();
+        disengage(age < 0.0 ? "iPhone TF stamp is in the future" : "iPhone TF is stale");
         return;
       }
       const auto& p = transform.transform.translation;
@@ -185,12 +236,12 @@ class TeleopIphone : public rclcpp::Node {
       phone_position = tf2::Vector3(p.x, p.y, p.z);
       phone_orientation = tf2::Quaternion(q.x, q.y, q.z, q.w);
       if (!valid_pose(phone_position, phone_orientation)) {
-        disengage();
+        disengage("invalid iPhone pose");
         return;
       }
       phone_orientation.normalize();
     } catch (const tf2::TransformException& error) {
-      disengage();
+      disengage("iPhone TF lookup failed");
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "iPhone pose unavailable: %s", error.what());
       return;
     }
@@ -213,7 +264,7 @@ class TeleopIphone : public rclcpp::Node {
     delta = tf2::Quaternion(0, 0, 0, 1).slerp(delta, rotation_scale_);
     const auto orientation = (delta * start_ee_orientation_).normalized();
     if (!valid_pose(position, orientation)) {
-      disengage();
+      disengage("invalid EE target");
       return;
     }
     geometry_msgs::msg::PoseStamped goal;
@@ -245,12 +296,16 @@ class TeleopIphone : public rclcpp::Node {
     mpc_target_pub_->publish(target);
   }
 
-  std::string iphone_source_frame_, iphone_target_frame_, goal_frame_, mode_;
+  std::string iphone_source_frame_, iphone_target_frame_, goal_frame_, mode_, home_mode_;
   double touch_threshold_, touch_timeout_, pose_timeout_, ee_timeout_, position_scale_, rotation_scale_;
+  double gripper_open_width_, gripper_closed_width_;
+  GripperState gripper_state_ = GripperState::Unknown;
   double last_mpc_time_ = 0.0;
   int mpc_input_dim_ = 12;
   bool have_touch_ = false, have_ee_ = false, pressing_ = false, release_required_ = false;
+  bool home_gesture_latched_ = false;
   size_t touch_count_ = 0;
+  std::string touch_radii_;
   Clock::time_point last_touch_, last_ee_;
   tf2::Vector3 ee_position_, start_phone_position_, start_ee_position_;
   tf2::Quaternion ee_orientation_, start_phone_orientation_, start_ee_orientation_, phone_to_world_;
@@ -258,6 +313,8 @@ class TeleopIphone : public rclcpp::Node {
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Publisher<ocs2_msgs::msg::MpcTargetTrajectories>::SharedPtr mpc_target_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_request_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gripper_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr touch_sub_;
   rclcpp::Subscription<ocs2_msgs::msg::MpcObservation>::SharedPtr ee_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_sub_;

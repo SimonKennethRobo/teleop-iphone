@@ -14,18 +14,27 @@ teleop_iphone:
     mpc_input_dim: 12
     ee_state_topic: "/go2_x5/ee/state"
     mode_topic: "/go2_x5/arm/mode/state"
+    mode_request_topic: "/go2_x5/arm/mode/request"
+    home_mode: "HOME"
+    # Two fingers keep tracking and open the gripper; one finger closes it.
+    # Widths are metres; arx5_ros2 clamps to the SDK gripper width.
+    gripper_command_topic: "/go2_x5/arm/gripper/command"
+    gripper_open_width: 0.087
+    gripper_closed_width: 0.0
     touch_topic: "/iphone/touch"
 
     # A touch is a clutch: press to capture phone and EE poses, move, release
-    # to stop. Three fingers disengage; release all fingers before re-clutching.
-    touch_threshold: 0.3
-    touch_timeout: 0.20
-    pose_timeout: 0.20
+    # to stop. Three fingers request HOME once; release all fingers before the
+    # gesture can trigger again or teleop can re-clutch.
+    touch_threshold: 0.2
+    touch_timeout: 0.50
+    pose_timeout: 0.50
     ee_state_timeout: 0.50
 
-    position_scale: 1.0
+    position_scale: 1.2
     rotation_scale: 0.6
     # Align the phone's corrected horizontal axes with the Go2-X5 world axes:
     # phone forward -> robot forward, phone left -> robot left.
-    phone_to_world_yaw: 1.5707963267948966
-    control_rate: 50.0
+    # phone_to_world_yaw: 1.5707963267948966
+    phone_to_world_yaw: 0.0
+    control_rate: 60.0
