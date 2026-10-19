@@ -9,6 +9,7 @@
 
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <ocs2_msgs/msg/mpc_observation.hpp>
 #include <ocs2_msgs/msg/mpc_target_trajectories.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -81,6 +82,8 @@ class TeleopIphone : public rclcpp::Node {
     rotation_scale_button_ = button_parameter("rotation_scale_button", 4);
     precision_button_ = button_parameter("precision_button", 5);
     align_button_ = button_parameter("align_button", 6);
+    ocs2_button_ = button_parameter("ocs2_button", 7);
+    wbc_button_ = button_parameter("wbc_button", 8);
     phone_yaw_ = declare_parameter<double>("phone_to_world_yaw", 1.5707963267948966);
     const double rate = positive_parameter("control_rate", 50.0);
     if (!std::isfinite(clutch_delay_) || clutch_delay_ < 0.0 ||
@@ -171,6 +174,28 @@ class TeleopIphone : public rclcpp::Node {
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(1.0 / rate)),
         [this]() { control(); });
     status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() { publish_status(); });
+
+    // Gamepad mode: left stick drives forward/lateral velocity, right stick
+    // x the yaw rate (Unitree remote layout). rl_sar ignores commands older
+    // than its own timeout; this node also sends one zero when the phone
+    // stream stops. ABXY and the D-pad are not mapped.
+    const auto gamepad_topic = declare_parameter<std::string>("gamepad_topic", "/iphone/gamepad");
+    const auto base_velocity_topic = declare_parameter<std::string>("base_velocity_topic", "/go2_x5/base/cmd_vel");
+    gamepad_timeout_ = positive_parameter("gamepad_timeout", 0.2);
+    max_linear_x_ = positive_parameter("gamepad_max_linear_x", 0.8);
+    max_linear_y_ = positive_parameter("gamepad_max_linear_y", 0.4);
+    max_yaw_rate_ = positive_parameter("gamepad_max_yaw_rate", 1.0);
+    base_velocity_pub_ = create_publisher<geometry_msgs::msg::Twist>(base_velocity_topic, rclcpp::QoS(1));
+    gamepad_sub_ = create_subscription<sensor_msgs::msg::Joy>(
+        gamepad_topic, rclcpp::SensorDataQoS().keep_last(1),
+        [this](sensor_msgs::msg::Joy::ConstSharedPtr msg) { on_gamepad(*msg); });
+    gamepad_timer_ = create_wall_timer(std::chrono::milliseconds(50), [this]() {
+      if (gamepad_driving_ && std::chrono::duration<double>(Clock::now() - last_gamepad_).count() > gamepad_timeout_) {
+        base_velocity_pub_->publish(geometry_msgs::msg::Twist());
+        gamepad_driving_ = false;
+        RCLCPP_WARN(get_logger(), "Gamepad stream stopped; base velocity zeroed");
+      }
+    });
     RCLCPP_INFO(get_logger(),
                 "EE teleop: %s -> %s and %s (%s). Waiting for OCS2/WBC, fresh EE feedback and touch input.",
                 ee_topic.c_str(), goal_topic.c_str(), mpc_target_topic.c_str(), goal_frame_.c_str());
@@ -237,6 +262,8 @@ class TeleopIphone : public rclcpp::Node {
       const bool tapped = have_buttons_ && presses > presses_[i];
       presses_[i] = presses;
       if (tapped && i == home_button_) request_home();
+      if (tapped && i == ocs2_button_) request_mode(ocs2_button_, "OCS2");
+      if (tapped && i == wbc_button_) request_mode(wbc_button_, "WBC");
     }
     for (size_t i = n; i < kMaxButtons; ++i) pressed_[i] = latched_[i] = false;
     have_buttons_ = true;
@@ -254,6 +281,21 @@ class TeleopIphone : public rclcpp::Node {
     }
   }
 
+  void on_gamepad(const sensor_msgs::msg::Joy& msg) {
+    if (msg.axes.size() < 4) return;
+    for (size_t i = 0; i < 4; ++i) {
+      if (!std::isfinite(msg.axes[i])) return;
+    }
+    geometry_msgs::msg::Twist velocity;
+    velocity.linear.x = std::clamp(static_cast<double>(msg.axes[1]), -1.0, 1.0) * max_linear_x_;
+    velocity.linear.y = -std::clamp(static_cast<double>(msg.axes[0]), -1.0, 1.0) * max_linear_y_;
+    velocity.angular.z = -std::clamp(static_cast<double>(msg.axes[2]), -1.0, 1.0) * max_yaw_rate_;
+    base_velocity_pub_->publish(velocity);
+    last_gamepad_ = Clock::now();
+    if (!gamepad_driving_) RCLCPP_INFO(get_logger(), "Gamepad driving the base on velocity topic");
+    gamepad_driving_ = true;
+  }
+
   void request_home() {
     disengage("HOME button");
     // Without a touch clutch, keep teleop from re-engaging before the arm
@@ -264,6 +306,19 @@ class TeleopIphone : public rclcpp::Node {
     request.data = home_mode_;
     mode_request_pub_->publish(request);
     RCLCPP_WARN(get_logger(), "f%zu: requesting arm mode %s", home_button_ + 1, home_mode_.c_str());
+  }
+
+  // The mode-state callback disengages once the switch is reported, so
+  // tracking re-anchors at the measured EE under the new controller.
+  void request_mode(size_t button, const char* mode) {
+    if (mode_ == mode) {
+      RCLCPP_INFO(get_logger(), "f%zu: arm mode is already %s", button + 1, mode);
+      return;
+    }
+    std_msgs::msg::String request;
+    request.data = mode;
+    mode_request_pub_->publish(request);
+    RCLCPP_WARN(get_logger(), "f%zu: requesting arm mode %s", button + 1, mode);
   }
 
   // Fingers resting on unlatched buttons are part of touch.count but are not
@@ -548,11 +603,14 @@ class TeleopIphone : public rclcpp::Node {
   std::string iphone_source_frame_, iphone_target_frame_, goal_frame_, mode_, home_mode_, align_reference_frame_;
   double touch_timeout_, pose_timeout_, ee_timeout_, clutch_delay_, home_hold_time_, position_scale_, rotation_scale_;
   double scale_range_, precision_factor_, align_hold_time_, phone_yaw_;
+  double gamepad_timeout_, max_linear_x_, max_linear_y_, max_yaw_rate_;
+  bool gamepad_driving_ = false;
+  Clock::time_point last_gamepad_;
   double gripper_open_width_, gripper_closed_width_, gripper_filter_alpha_, gripper_deadband_;
   double gripper_filtered_ = NAN, gripper_sent_ = NAN;
   double active_position_scale_ = 0.0, active_rotation_scale_ = 0.0;
   size_t position_scale_button_, home_button_, axis_lock_button_, rotation_scale_button_;
-  size_t precision_button_, align_button_;
+  size_t precision_button_, align_button_, ocs2_button_, wbc_button_;
   std::array<bool, kMaxButtons> pressed_{}, latched_{};
   std::array<double, kMaxButtons> values_{};
   std::array<int, kMaxButtons> presses_{};
@@ -573,13 +631,15 @@ class TeleopIphone : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_request_pub_, status_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gripper_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr base_velocity_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr gamepad_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr touch_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr buttons_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr tracking_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr opening_sub_;
   rclcpp::Subscription<ocs2_msgs::msg::MpcObservation>::SharedPtr ee_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_sub_;
-  rclcpp::TimerBase::SharedPtr timer_, status_timer_;
+  rclcpp::TimerBase::SharedPtr timer_, status_timer_, gamepad_timer_;
 };
 
 int main(int argc, char** argv) {

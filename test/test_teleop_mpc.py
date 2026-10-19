@@ -45,5 +45,6 @@ def test_teleoperation_schema_topics_match():
         assert f'"{topic}"' in osc
         assert f'"/{topic}"' in config
     for key, button in (("position_scale_button", 1), ("home_button", 2), ("axis_lock_button", 3),
-                        ("rotation_scale_button", 4), ("precision_button", 5), ("align_button", 6)):
+                        ("rotation_scale_button", 4), ("precision_button", 5), ("align_button", 6),
+                        ("ocs2_button", 7), ("wbc_button", 8)):
         assert f"{key}: {button}" in config

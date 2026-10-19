@@ -54,12 +54,15 @@ teleop_iphone:
     #   f5 held: precision mode, both scales x precision_factor
     #   f6 held align_hold_time: phone heading -> align_reference_frame +x
     #         (goal_frame +x when empty)
+    #   f7/f8 tap: request OCS2/WBC arm mode
     position_scale_button: 1
     home_button: 2
     axis_lock_button: 3
     rotation_scale_button: 4
     precision_button: 5
     align_button: 6
+    ocs2_button: 7
+    wbc_button: 8
     scale_slider_range: 3.0
     precision_factor: 0.3
     align_hold_time: 0.6
@@ -71,3 +74,14 @@ teleop_iphone:
     phone_to_world_yaw: 1.5707963267948966
     # phone_to_world_yaw: 0.0
     control_rate: 60.0
+
+    # Gamepad mode: left stick y/x -> base forward/left velocity, right stick
+    # x -> yaw rate (stick right = turn right), scaled by the maxima below
+    # (m/s, rad/s). rl_sar clamps them to the policy's limit_vel_* and drops
+    # commands older than 0.25 s. ABXY and the D-pad are not mapped.
+    gamepad_topic: "/iphone/gamepad"
+    base_velocity_topic: "/go2_x5/base/cmd_vel"
+    gamepad_timeout: 0.2
+    gamepad_max_linear_x: 0.8
+    gamepad_max_linear_y: 0.4
+    gamepad_max_yaw_rate: 1.0

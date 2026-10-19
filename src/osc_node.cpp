@@ -174,6 +174,7 @@ class OSCNode : public rclcpp::Node {
         compass_pub_    = this->create_publisher<std_msgs::msg::Float64>("iphone/compass_heading", 10);
         touch_pub_      = this->create_publisher<geometry_msgs::msg::PoseArray>("iphone/touch", 10);
         buttons_pub_    = this->create_publisher<sensor_msgs::msg::Joy>("iphone/buttons", 10);
+        gamepad_pub_    = this->create_publisher<sensor_msgs::msg::Joy>("iphone/gamepad", 10);
         tracking_ok_pub_ = this->create_publisher<std_msgs::msg::Bool>("iphone/tracking_ok", 10);
         gripper_opening_pub_ = this->create_publisher<std_msgs::msg::Float64>("iphone/gripper/opening", 10);
 
@@ -401,6 +402,9 @@ class OSCNode : public rclcpp::Node {
     void process_teleop_packet(const json& j, rclcpp::Time stamp) {
         const bool active     = get_json_value<bool>(j, "active", false);
         const bool pose_valid = get_json_value<bool>(j, "poseValid", false);
+        // Packets without controlMode predate Gamepad and are ARKit packets.
+        const std::string control_mode = get_json_value<std::string>(j, "controlMode", "arkit");
+        if (control_mode == "gamepad") publish_gamepad(j, active, stamp);
         const bool tracking_ok =
             active && pose_valid && get_json_value<std::string>(j, "tracking", "") == "normal";
         std_msgs::msg::Bool ok;
@@ -435,7 +439,9 @@ class OSCNode : public rclcpp::Node {
 
         // Joy layout per button i (0-based, f1 = 0): buttons[i] pressed,
         // buttons[N+i] latched, buttons[2N+i] press counter; axes[i] value.
-        if (j.contains("buttons") && j["buttons"].is_object()) {
+        // Gamepad reuses button1..8 for the D-pad and ABXY, which are not
+        // mapped yet; publishing them would trigger the f1-f8 functions.
+        if (control_mode == "arkit" && j.contains("buttons") && j["buttons"].is_object()) {
             const auto& b       = j["buttons"];
             const auto  array_at = [&b](const char* key, size_t i, double fallback) {
                 if (!b.contains(key) || !b[key].is_array() || i >= b[key].size()) return fallback;
@@ -467,6 +473,35 @@ class OSCNode : public rclcpp::Node {
                 gripper_opening_pub_->publish(opening);
             }
         }
+    }
+
+    // Joy axes [left x, left y, right x, right y]: unit disc, x right and y up,
+    // centred while inactive. Invalid sticks publish nothing, so the
+    // receiver's freshness timeout stops the robot.
+    void publish_gamepad(const json& j, bool active, rclcpp::Time stamp) {
+        sensor_msgs::msg::Joy joy;
+        joy.header.stamp    = stamp;
+        joy.header.frame_id = frame_id_;
+        joy.axes.assign(4, 0.0f);
+        if (active) {
+            if (!j.contains("gamepad") || !j["gamepad"].is_object()) return;
+            const auto& g = j["gamepad"];
+            const char* sticks[] = {"left", "right"};
+            for (size_t s = 0; s < 2; ++s) {
+                if (!g.contains(sticks[s]) || !g[sticks[s]].is_object()) return;
+                const auto& stick = g[sticks[s]];
+                const double x = get_json_value<double>(stick, "x", NAN);
+                const double y = get_json_value<double>(stick, "y", NAN);
+                if (!std::isfinite(x) || !std::isfinite(y) || std::hypot(x, y) > 1.0 + 1e-3) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                         "Ignoring gamepad packet with invalid %s stick", sticks[s]);
+                    return;
+                }
+                joy.axes[2 * s]     = static_cast<float>(x);
+                joy.axes[2 * s + 1] = static_cast<float>(y);
+            }
+        }
+        gamepad_pub_->publish(joy);
     }
 
     void process_osc_message(const char* data, size_t size) {
@@ -851,6 +886,7 @@ class OSCNode : public rclcpp::Node {
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr             compass_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr      touch_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr              buttons_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr              gamepad_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                tracking_ok_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr             gripper_opening_pub_;
 
