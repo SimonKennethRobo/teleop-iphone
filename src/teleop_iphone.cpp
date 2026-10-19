@@ -396,8 +396,30 @@ class TeleopIphone : public rclcpp::Node {
                 phone_yaw_ * 180.0 / M_PI);
   }
 
+  // Align needs only a fresh phone pose, so it also runs outside OCS2/WBC.
+  void align_from_phone_tf() {
+    try {
+      const auto transform = tf_buffer_->lookupTransform(iphone_source_frame_, iphone_target_frame_, tf2::TimePointZero);
+      const double age = (now() - rclcpp::Time(transform.header.stamp, get_clock()->get_clock_type())).seconds();
+      const auto& p = transform.transform.translation;
+      const auto& q = transform.transform.rotation;
+      tf2::Quaternion orientation(q.x, q.y, q.z, q.w);
+      if (age < 0.0 || age > pose_timeout_ || !valid_pose(tf2::Vector3(p.x, p.y, p.z), orientation)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Align waiting for a fresh iPhone pose");
+        return;
+      }
+      orientation.normalize();
+      align_pending_ = false;
+      align_heading(orientation);
+      if (pressing_) reanchor_ = true;
+    } catch (const tf2::TransformException& error) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Align waiting for iPhone pose: %s", error.what());
+    }
+  }
+
   void control() {
     const auto wall = Clock::now();
+    if (align_pending_) align_from_phone_tf();
     if (mode_.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "Not publishing EE target: waiting for arm mode state");
@@ -440,12 +462,6 @@ class TeleopIphone : public rclcpp::Node {
       disengage("iPhone TF lookup failed");
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "iPhone pose unavailable: %s", error.what());
     }
-    if (align_pending_ && have_phone) {
-      align_pending_ = false;
-      align_heading(phone_orientation);
-      if (pressing_) reanchor_ = true;
-    }
-
     // With a touch clutch, the required release already covers HOME.
     if (!require_touch_clutch_ && wall < home_hold_until_) {
       pressing_ = false;

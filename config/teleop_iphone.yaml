@@ -53,7 +53,7 @@ teleop_iphone:
     #   f3 latched: >50% rotation only, <50% translation only
     #   f5 held: precision mode, both scales x precision_factor
     #   f6 held align_hold_time: phone heading -> align_reference_frame +x
-    #         (goal_frame +x when empty)
+    #         (goal_frame +x when empty); works in any arm mode
     #   f7/f8 tap: request OCS2/WBC arm mode
     position_scale_button: 1
     home_button: 2
