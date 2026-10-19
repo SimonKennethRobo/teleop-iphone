@@ -11,19 +11,21 @@ def generate_launch_description():
     osc_config = PathJoinSubstitution([pkg_share, "config", "osc_params.yaml"])
     teleop_config = PathJoinSubstitution([pkg_share, "config", "teleop_iphone.yaml"])
     rviz_config = PathJoinSubstitution([pkg_share, "config", "default.rviz"])
+    osc_arg = DeclareLaunchArgument("osc_config", default_value=osc_config)
+    teleop_arg = DeclareLaunchArgument("teleop_config", default_value=teleop_config)
     use_rviz = DeclareLaunchArgument("rviz", default_value="false")
 
     osc_node = Node(
         package="teleop_iphone", executable="osc_node", name="osc_node",
-        output="screen", parameters=[osc_config], emulate_tty=True,
+        output="screen", parameters=[LaunchConfiguration("osc_config")], emulate_tty=True,
     )
     teleop_node = Node(
         package="teleop_iphone", executable="teleop_iphone", name="teleop_iphone",
-        output="screen", parameters=[teleop_config], emulate_tty=True,
+        output="screen", parameters=[LaunchConfiguration("teleop_config")], emulate_tty=True,
     )
     rviz_node = Node(
         package="rviz2", executable="rviz2", name="teleop_iphone_rviz",
         output="screen", arguments=["-d", rviz_config], emulate_tty=True,
         condition=IfCondition(LaunchConfiguration("rviz")),
     )
-    return LaunchDescription([use_rviz, osc_node, teleop_node, rviz_node])
+    return LaunchDescription([osc_arg, teleop_arg, use_rviz, osc_node, teleop_node, rviz_node])

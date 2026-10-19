@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -23,8 +24,10 @@
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <sensor_msgs/msg/fluid_pressure.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/magnetic_field.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/header.hpp>
 
@@ -170,6 +173,9 @@ class OSCNode : public rclcpp::Node {
         pressure_pub_   = this->create_publisher<sensor_msgs::msg::FluidPressure>("iphone/pressure", 10);
         compass_pub_    = this->create_publisher<std_msgs::msg::Float64>("iphone/compass_heading", 10);
         touch_pub_      = this->create_publisher<geometry_msgs::msg::PoseArray>("iphone/touch", 10);
+        buttons_pub_    = this->create_publisher<sensor_msgs::msg::Joy>("iphone/buttons", 10);
+        tracking_ok_pub_ = this->create_publisher<std_msgs::msg::Bool>("iphone/tracking_ok", 10);
+        gripper_opening_pub_ = this->create_publisher<std_msgs::msg::Float64>("iphone/gripper/opening", 10);
 
         // Create TF broadcaster
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -283,6 +289,11 @@ class OSCNode : public rclcpp::Node {
 
             auto now = this->now();
 
+            if (j.is_object() && j.value("type", "") == "teleoperation") {
+                process_teleop_packet(j, now);
+                return;
+            }
+
             // ZigSim Pro nests sensor data under "sensordata" key
             json sensor_data = j;
             if (j.contains("sensordata")) {
@@ -383,6 +394,78 @@ class OSCNode : public rclcpp::Node {
         } catch (const json::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                  "Failed to parse JSON packet (%zu bytes): %s", size, e.what());
+        }
+    }
+
+    // Teleoperation app schema v1: flat pose/touch/buttons/gripper object.
+    void process_teleop_packet(const json& j, rclcpp::Time stamp) {
+        const bool active     = get_json_value<bool>(j, "active", false);
+        const bool pose_valid = get_json_value<bool>(j, "poseValid", false);
+        const bool tracking_ok =
+            active && pose_valid && get_json_value<std::string>(j, "tracking", "") == "normal";
+        std_msgs::msg::Bool ok;
+        ok.data = tracking_ok;
+        tracking_ok_pub_->publish(ok);
+
+        // Without a TF the teleop node treats the phone pose as stale.
+        if (tracking_ok && j.contains("pose")) {
+            const auto& pose = j["pose"];
+            if (pose.contains("position") && pose["position"].is_array() && pose["position"].size() >= 3 &&
+                pose.contains("orientation") && pose["orientation"].is_array() && pose["orientation"].size() >= 4) {
+                publish_arkit_pose_json(json{{"position", pose["position"]}, {"rotation", pose["orientation"]}},
+                                        stamp);
+            }
+        }
+
+        // One pose per finger; every pose carries the primary touch point.
+        auto touch_msg            = geometry_msgs::msg::PoseArray();
+        touch_msg.header.stamp    = stamp;
+        touch_msg.header.frame_id = frame_id_;
+        if (active && j.contains("touch") && j["touch"].is_object()) {
+            const auto& touch = j["touch"];
+            const int   count = get_json_value<bool>(touch, "active", false) ? get_json_value<int>(touch, "count", 0) : 0;
+            geometry_msgs::msg::Pose pose;
+            pose.position.x    = get_json_value<double>(touch, "x", 0.0);
+            pose.position.y    = get_json_value<double>(touch, "y", 0.0);
+            pose.position.z    = get_json_value<double>(touch, "force", 0.0);
+            pose.orientation.w = 1.0;
+            for (int i = 0; i < count; ++i) touch_msg.poses.push_back(pose);
+        }
+        touch_pub_->publish(touch_msg);
+
+        // Joy layout per button i (0-based, f1 = 0): buttons[i] pressed,
+        // buttons[N+i] latched, buttons[2N+i] press counter; axes[i] value.
+        if (j.contains("buttons") && j["buttons"].is_object()) {
+            const auto& b       = j["buttons"];
+            const auto  array_at = [&b](const char* key, size_t i, double fallback) {
+                if (!b.contains(key) || !b[key].is_array() || i >= b[key].size()) return fallback;
+                const auto& v = b[key][i];
+                return v.is_boolean() ? (v.get<bool>() ? 1.0 : 0.0) : v.is_number() ? v.get<double>() : fallback;
+            };
+            size_t n = 0;
+            while (b.contains("button" + std::to_string(n + 1))) ++n;
+            sensor_msgs::msg::Joy joy;
+            joy.header.stamp    = stamp;
+            joy.header.frame_id = frame_id_;
+            joy.axes.resize(n);
+            joy.buttons.resize(3 * n);
+            for (size_t i = 0; i < n; ++i) {
+                joy.buttons[i]         = active && get_json_value<bool>(b, "button" + std::to_string(i + 1), false);
+                joy.buttons[n + i]     = active && array_at("latched", i, 0.0) > 0.5;
+                joy.buttons[2 * n + i] = static_cast<int>(array_at("presses", i, 0.0));
+                joy.axes[i]            = static_cast<float>(array_at("values", i, 0.0));
+            }
+            buttons_pub_->publish(joy);
+        }
+
+        // "opening" is absent whenever the marker estimate is invalid.
+        if (active && j.contains("gripper")) {
+            const auto& g = j["gripper"];
+            if (get_json_value<bool>(g, "valid", false) && g.contains("opening") && g["opening"].is_number()) {
+                std_msgs::msg::Float64 opening;
+                opening.data = std::clamp(g["opening"].get<double>(), 0.0, 1.0);
+                gripper_opening_pub_->publish(opening);
+            }
         }
     }
 
@@ -767,6 +850,9 @@ class OSCNode : public rclcpp::Node {
     rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr    pressure_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr             compass_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr      touch_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr              buttons_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                tracking_ok_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr             gripper_opening_pub_;
 
     // TF broadcaster
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
