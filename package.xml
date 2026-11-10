@@ -3,7 +3,7 @@
 <package format="3">
   <name>teleop_iphone</name>
   <version>1.0.0</version>
-  <description>ROS2 package for receiving OSC data from ZigSim Pro and publishing to ROS topics</description>
+  <description>ZigSim Pro iPhone teleoperation of Go2-X5 OCS2 end-effector targets</description>
   <maintainer email="user@todo.todo">Simon</maintainer>
   <license>MIT</license>
 
@@ -14,9 +14,15 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>ocs2_msgs</depend>
 
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <test_depend>ament_cmake_pytest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -1,5 +1,7 @@
 # ROS2 Topics
 
+For Go2-X5 OCS2 teleoperation, the package consumes `/go2_x5/ee/state` (`ocs2_msgs/msg/MpcObservation`) and publishes `/go2_x5/ee/goal` (`geometry_msgs/msg/PoseStamped`) plus `/mobile_manipulator_mpc_target` (`ocs2_msgs/msg/MpcTargetTrajectories`). A three-finger gesture publishes `HOME` once to `/go2_x5/arm/mode/request`. The planner-facing goal remains available when `go2_x5_planning` is running; OCS2 remains the joint-command owner.
+
 Complete list of all published topics and their message types.
 
 ## Published Topics
@@ -14,6 +16,10 @@ Complete list of all published topics and their message types.
 | `/iphone/gravity`         | `geometry_msgs/Vector3Stamped` | ~60Hz | Gravity vector                                     |
 | `/iphone/pressure`        | `sensor_msgs/FluidPressure`    | ~1Hz  | Barometric pressure (in Pascals)                   |
 | `/iphone/compass_heading` | `std_msgs/Float64`             | ~60Hz | Compass heading (degrees, 0-360)                   |
+| `/go2_x5/ee/goal`         | `geometry_msgs/PoseStamped`    | ~50Hz | World-frame teleop EE goal for the planner         |
+| `/mobile_manipulator_mpc_target` | `ocs2_msgs/MpcTargetTrajectories` | ~50Hz | Native OCS2 EE target |
+| `/go2_x5/arm/mode/request` | `std_msgs/String`              | Event | Three-finger `HOME` mode request                   |
+| `/go2_x5/arm/gripper/command` | `std_msgs/Float64`         | Event | Gripper width (m): open with two fingers, closed with one |
 
 ## Topic Details
 
@@ -183,7 +189,7 @@ gnome-terminal --tab --title="Gravity" -- bash -c "ros2 topic echo /iphone/gravi
 All topics use the same frame ID (default: `iphone`), configurable via the `frame_id` parameter:
 
 ```bash
-ros2 launch teleop_iphone zigsim_osc.launch.py frame_id:=mobile_device
+ros2 launch teleop_iphone teleop.launch.py frame_id:=mobile_device
 ```
 
 ## Troubleshooting

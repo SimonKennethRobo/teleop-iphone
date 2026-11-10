@@ -74,7 +74,7 @@ The node parses these JSON fields from ZigSim Pro:
 1. **Launch the node with default settings** (port 8000):
 
    ```bash
-   ros2 launch teleop_iphone zigsim_osc.launch.py
+   ros2 launch teleop_iphone teleop.launch.py
    ```
 2. **Configure ZigSim Pro on your iPhone**:
 
@@ -98,7 +98,7 @@ The node parses these JSON fields from ZigSim Pro:
 Launch with a custom port:
 
 ```bash
-ros2 launch teleop_iphone zigsim_osc.launch.py port:=9000
+ros2 launch teleop_iphone teleop.launch.py port:=9000
 ```
 
 ### Custom Frame ID
@@ -106,7 +106,7 @@ ros2 launch teleop_iphone zigsim_osc.launch.py port:=9000
 Change the frame ID for the sensor data:
 
 ```bash
-ros2 launch teleop_iphone zigsim_osc.launch.py frame_id:=mobile_device
+ros2 launch teleop_iphone teleop.launch.py frame_id:=mobile_device
 ```
 
 ### Run Node Directly
@@ -199,7 +199,7 @@ In RViz2:
 Change the port number:
 
 ```bash
-ros2 launch teleop_iphone zigsim_osc.launch.py port:=8001
+ros2 launch teleop_iphone teleop.launch.py port:=8001
 ```
 
 ### Topics not publishing
