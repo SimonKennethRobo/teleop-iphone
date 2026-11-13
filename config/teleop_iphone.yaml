@@ -16,25 +16,72 @@ teleop_iphone:
     mode_topic: "/go2_x5/arm/mode/state"
     mode_request_topic: "/go2_x5/arm/mode/request"
     home_mode: "HOME"
-    # Two fingers keep tracking and open the gripper; one finger closes it.
-    # Widths are metres; arx5_ros2 clamps to the SDK gripper width.
+    # The gripper follows the phone's marker-based opening (0 closed, 1 open),
+    # low-pass filtered and held while the estimate is invalid. Widths are
+    # metres; arx5_ros2 clamps to the SDK gripper width.
     gripper_command_topic: "/go2_x5/arm/gripper/command"
     gripper_open_width: 0.087
     gripper_closed_width: 0.0
+    gripper_filter_alpha: 0.3
+    gripper_deadband: 0.002
     touch_topic: "/iphone/touch"
+    buttons_topic: "/iphone/buttons"
+    tracking_ok_topic: "/iphone/tracking_ok"
+    gripper_opening_topic: "/iphone/gripper/opening"
+    status_topic: "/teleop_iphone/status"
+    status_marker_topic: "/teleop_iphone/status_marker"
 
-    # A touch is a clutch: press to capture phone and EE poses, move, release
-    # to stop. Three fingers request HOME once; release all fingers before the
-    # gesture can trigger again or teleop can re-clutch.
-    touch_threshold: 0.2
+    # false: the phone's transmit switch is the clutch. Tracking engages
+    # (re-anchored at the measured EE) whenever the stream is healthy and stops
+    # when it goes inactive, loses tracking or times out.
+    # true: additionally hold a finger outside the buttons to track.
+    require_touch_clutch: false
+    clutch_engage_delay: 0.15
+    # After f2 HOME, stay disengaged until the arm mode changes or this expires.
+    home_hold_time: 2.0
     touch_timeout: 0.50
     pose_timeout: 0.50
     ee_state_timeout: 0.50
 
     position_scale: 1.2
     rotation_scale: 0.6
-    # Align the phone's corrected horizontal axes with the Go2-X5 world axes:
-    # phone forward -> robot forward, phone left -> robot left.
-    # phone_to_world_yaw: 1.5707963267948966
-    phone_to_world_yaw: 0.0
+
+    # Phone buttons f1..f8 (1-based).
+    #   f1/f4 latched slider: position/rotation scale x range^(2*value-1)
+    #         (<50% shrinks, >50% grows, unlatched = base scale)
+    #   f2 tap: request home_mode
+    #   f3 latched: >50% rotation only, <50% translation only
+    #   f5 held: precision mode, both scales x precision_factor
+    #   f6 held align_hold_time: phone heading -> align_reference_frame +x
+    #         (goal_frame +x when empty); works in any arm mode
+    #   f7/f8 tap: request OCS2/WBC arm mode
+    position_scale_button: 1
+    home_button: 2
+    axis_lock_button: 3
+    rotation_scale_button: 4
+    precision_button: 5
+    align_button: 6
+    ocs2_button: 7
+    wbc_button: 8
+    scale_slider_range: 3.0
+    precision_factor: 0.3
+    align_hold_time: 0.6
+    # The world +x is a mocap room axis, so align to the robot base heading
+    # (go2_odometry publishes world -> odom -> base). Sampled once per f6 press.
+    align_reference_frame: "base"
+    # Initial yaw before the first f6 align. ARKit and world headings are both
+    # arbitrary, so press f6 with the phone facing robot forward before use.
+    phone_to_world_yaw: 1.5707963267948966
+    # phone_to_world_yaw: 0.0
     control_rate: 60.0
+
+    # Gamepad mode: left stick y/x -> base forward/left velocity, right stick
+    # x -> yaw rate (stick right = turn right), scaled by the maxima below
+    # (m/s, rad/s). rl_sar clamps them to the policy's limit_vel_* and drops
+    # commands older than 0.25 s. ABXY and the D-pad are not mapped.
+    gamepad_topic: "/iphone/gamepad"
+    base_velocity_topic: "/go2_x5/base/cmd_vel"
+    gamepad_timeout: 0.2
+    gamepad_max_linear_x: 0.8
+    gamepad_max_linear_y: 0.4
+    gamepad_max_yaw_rate: 1.0

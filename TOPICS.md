@@ -1,6 +1,6 @@
 # ROS2 Topics
 
-For Go2-X5 OCS2 teleoperation, the package consumes `/go2_x5/ee/state` (`ocs2_msgs/msg/MpcObservation`) and publishes `/go2_x5/ee/goal` (`geometry_msgs/msg/PoseStamped`) plus `/mobile_manipulator_mpc_target` (`ocs2_msgs/msg/MpcTargetTrajectories`). A three-finger gesture publishes `HOME` once to `/go2_x5/arm/mode/request`. The planner-facing goal remains available when `go2_x5_planning` is running; OCS2 remains the joint-command owner.
+For Go2-X5 OCS2 teleoperation, the package consumes `/go2_x5/ee/state` (`ocs2_msgs/msg/MpcObservation`) and publishes `/go2_x5/ee/goal` (`geometry_msgs/msg/PoseStamped`) plus `/mobile_manipulator_mpc_target` (`ocs2_msgs/msg/MpcTargetTrajectories`). Phone buttons f2/f7/f8 publish `HOME`/`OCS2`/`WBC` to `/go2_x5/arm/mode/request`; see `config/teleop_iphone.yaml` for the f1-f8 mapping. The planner-facing goal remains available when `go2_x5_planning` is running; OCS2 remains the joint-command owner.
 
 Complete list of all published topics and their message types.
 
@@ -18,8 +18,16 @@ Complete list of all published topics and their message types.
 | `/iphone/compass_heading` | `std_msgs/Float64`             | ~60Hz | Compass heading (degrees, 0-360)                   |
 | `/go2_x5/ee/goal`         | `geometry_msgs/PoseStamped`    | ~50Hz | World-frame teleop EE goal for the planner         |
 | `/mobile_manipulator_mpc_target` | `ocs2_msgs/MpcTargetTrajectories` | ~50Hz | Native OCS2 EE target |
-| `/go2_x5/arm/mode/request` | `std_msgs/String`              | Event | Three-finger `HOME` mode request                   |
-| `/go2_x5/arm/gripper/command` | `std_msgs/Float64`         | Event | Gripper width (m): open with two fingers, closed with one |
+| `/go2_x5/arm/mode/request` | `std_msgs/String`              | Event | f2/f7/f8 tap `HOME`/`OCS2`/`WBC` mode request     |
+| `/go2_x5/arm/gripper/command` | `std_msgs/Float64`         | Event | Gripper width (m) from the filtered phone gripper opening |
+| `/iphone/touch`           | `geometry_msgs/PoseArray`      | ~40Hz | One pose per finger (primary touch x/y)            |
+| `/iphone/buttons`         | `sensor_msgs/Joy`              | ~40Hz | 3D mode only. N=8: `buttons[i]` pressed, `buttons[N+i]` latched, `buttons[2N+i]` press count, `axes[i]` slider value 0-1 |
+| `/iphone/gamepad`         | `sensor_msgs/Joy`              | ~60Hz | Gamepad mode only. `axes` = [left x, left y, right x, right y], unit disc, x right / y up; zero while inactive |
+| `/go2_x5/base/cmd_vel`    | `geometry_msgs/Twist`          | ~60Hz | Gamepad base velocity for rl_sar: left stick -> `linear.x/y`, right stick x -> `angular.z` |
+| `/iphone/tracking_ok`     | `std_msgs/Bool`                | ~40Hz | `active && poseValid && tracking == "normal"`      |
+| `/iphone/gripper/opening` | `std_msgs/Float64`             | ~14Hz | Marker gripper opening 0 (closed) - 1 (open), only while valid |
+| `/teleop_iphone/status`   | `std_msgs/String`              | 5Hz   | Effective scales, axis lock, precision, yaw, gripper |
+| `/teleop_iphone/status_marker` | `visualization_msgs/Marker` | 5Hz  | RViz text above the EE                             |
 
 ## Topic Details
 

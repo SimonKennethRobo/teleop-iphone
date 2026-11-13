@@ -18,6 +18,7 @@ find_package(nav_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(ocs2_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 # Include directories
 include_directories(
@@ -51,7 +52,9 @@ add_executable(teleop_iphone
 ament_target_dependencies(teleop_iphone
   rclcpp
   std_msgs
+  sensor_msgs
   geometry_msgs
+  visualization_msgs
   tf2_ros
   tf2
   ocs2_msgs
