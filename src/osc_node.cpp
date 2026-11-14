@@ -30,6 +30,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -178,6 +179,8 @@ class OSCNode : public rclcpp::Node {
         tracking_ok_pub_ = this->create_publisher<std_msgs::msg::Bool>("iphone/tracking_ok", 10);
         gripper_opening_pub_ = this->create_publisher<std_msgs::msg::Float64>("iphone/gripper/opening", 10);
 
+        peer_pub_ = create_publisher<std_msgs::msg::String>("iphone/peer", rclcpp::QoS(1));
+
         // Create TF broadcaster
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -202,6 +205,9 @@ class OSCNode : public rclcpp::Node {
     }
 
    private:
+    std::string teleop_stream_, teleop_mode_;
+    int64_t teleop_sequence_ = -1;
+
     bool init_socket() {
         sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
         if (sockfd_ < 0) {
@@ -263,7 +269,7 @@ class OSCNode : public rclcpp::Node {
                 // Detect format based on first character
                 if (n > 0 && buffer[0] == '{') {
                     // JSON format
-                    process_json_packet(buffer, n);
+                    process_json_packet(buffer, n, client_ip);
                 } else if (n > 8 && strncmp(buffer, "#bundle", 7) == 0) {
                     // OSC bundle format
                     process_osc_bundle(buffer, n);
@@ -280,7 +286,7 @@ class OSCNode : public rclcpp::Node {
         }
     }
 
-    void process_json_packet(const char* data, size_t size) {
+    void process_json_packet(const char* data, size_t size, const std::string& client_ip) {
         try {
             // Parse JSON
             json j = json::parse(std::string(data, size));
@@ -291,7 +297,7 @@ class OSCNode : public rclcpp::Node {
             auto now = this->now();
 
             if (j.is_object() && j.value("type", "") == "teleoperation") {
-                process_teleop_packet(j, now);
+                process_teleop_packet(j, now, client_ip);
                 return;
             }
 
@@ -399,14 +405,31 @@ class OSCNode : public rclcpp::Node {
     }
 
     // Teleoperation app schema v1: flat pose/touch/buttons/gripper object.
-    void process_teleop_packet(const json& j, rclcpp::Time stamp) {
+    void process_teleop_packet(const json& j, rclcpp::Time stamp, const std::string& client_ip) {
+        if (get_json_value<int>(j, "schemaVersion", 0) != 1) return;
+        const auto stream = get_json_value<std::string>(j, "streamID", "");
+        const auto sequence = get_json_value<int64_t>(j, "sequence", -1);
+        if (stream.empty() || sequence < 0) return;
+        if (stream == teleop_stream_ && sequence <= teleop_sequence_) return;
+        const bool new_stream = stream != teleop_stream_;
+        teleop_stream_ = stream;
+        teleop_sequence_ = sequence;
         const bool active     = get_json_value<bool>(j, "active", false);
         const bool pose_valid = get_json_value<bool>(j, "poseValid", false);
         // Packets without controlMode predate Gamepad and are ARKit packets.
         const std::string control_mode = get_json_value<std::string>(j, "controlMode", "arkit");
-        if (control_mode == "gamepad") publish_gamepad(j, active, stamp);
+        if (control_mode != "arkit" && control_mode != "gamepad") return;
+        if (control_mode == "gamepad" && !publish_gamepad(j, active, stamp)) return;
+        if (control_mode == "arkit") {
+            // A mode switch must stop a previously moving base immediately.
+            sensor_msgs::msg::Joy neutral;
+            neutral.header.stamp = stamp;
+            neutral.axes.assign(9, 0.0f);
+            gamepad_pub_->publish(neutral);
+        }
         const bool tracking_ok =
-            active && pose_valid && get_json_value<std::string>(j, "tracking", "") == "normal";
+            control_mode == "arkit" && active && pose_valid &&
+            get_json_value<std::string>(j, "tracking", "") == "normal";
         std_msgs::msg::Bool ok;
         ok.data = tracking_ok;
         tracking_ok_pub_->publish(ok);
@@ -437,35 +460,49 @@ class OSCNode : public rclcpp::Node {
         }
         touch_pub_->publish(touch_msg);
 
-        // Joy layout per button i (0-based, f1 = 0): buttons[i] pressed,
-        // buttons[N+i] latched, buttons[2N+i] press counter; axes[i] value.
-        // Gamepad reuses button1..8 for the D-pad and ABXY, which are not
-        // mapped yet; publishing them would trigger the f1-f8 functions.
-        if (control_mode == "arkit" && j.contains("buttons") && j["buttons"].is_object()) {
-            const auto& b       = j["buttons"];
-            const auto  array_at = [&b](const char* key, size_t i, double fallback) {
-                if (!b.contains(key) || !b[key].is_array() || i >= b[key].size()) return fallback;
-                const auto& v = b[key][i];
-                return v.is_boolean() ? (v.get<bool>() ? 1.0 : 0.0) : v.is_number() ? v.get<double>() : fallback;
-            };
-            size_t n = 0;
-            while (b.contains("button" + std::to_string(n + 1))) ++n;
-            sensor_msgs::msg::Joy joy;
-            joy.header.stamp    = stamp;
-            joy.header.frame_id = frame_id_;
-            joy.axes.resize(n);
-            joy.buttons.resize(3 * n);
-            for (size_t i = 0; i < n; ++i) {
-                joy.buttons[i]         = active && get_json_value<bool>(b, "button" + std::to_string(i + 1), false);
-                joy.buttons[n + i]     = active && array_at("latched", i, 0.0) > 0.5;
-                joy.buttons[2 * n + i] = static_cast<int>(array_at("presses", i, 0.0));
-                joy.axes[i]            = static_cast<float>(array_at("values", i, 0.0));
-            }
-            buttons_pub_->publish(joy);
+        // Canonical slots: A/B/X/Y/F1/F2/F3/F4 in BOTH modes.
+        // Gamepad wire button1..4 are D-pad, button5..8 are ABXY.
+        const auto b = j.value("buttons", json::object());
+        const auto functions = control_mode == "gamepad"
+            ? j.at("gamepad").value("functions", json::object()) : json::object();
+        sensor_msgs::msg::Joy joy;
+        joy.header.stamp = stamp;
+        joy.header.frame_id = frame_id_ + "/" + control_mode + "/" + stream;
+        joy.axes.assign(8, 0.0f);
+        joy.buttons.assign(27, 0);
+        joy.buttons[24] = active;
+        joy.buttons[26] = control_mode == "arkit";
+        joy.buttons[25] = new_stream || control_mode != teleop_mode_;
+        teleop_mode_ = control_mode;
+        const auto array_at = [](const json& object, const char* key, size_t i, double fallback) {
+            if (!object.is_object() || !object.contains(key) || !object[key].is_array() ||
+                i >= object[key].size()) return fallback;
+            const auto& v = object[key][i];
+            return v.is_boolean() ? (v.get<bool>() ? 1.0 : 0.0) : v.is_number() ? v.get<double>() : fallback;
+        };
+        for (size_t i = 0; i < 8; ++i) {
+            const bool function = control_mode == "gamepad" && i >= 4;
+            const size_t wire = control_mode == "gamepad" ? (function ? i - 4 : i + 4) : i;
+            const auto& source = function ? functions : b;
+            const bool down = function ? array_at(source, "states", wire, 0.0) > 0.5
+                : get_json_value<bool>(source, "button" + std::to_string(wire + 1), false);
+            joy.buttons[i] = active && down;
+            // Gamepad does not transmit latch flags; its retained states/values
+            // are already authoritative, including while a function is held.
+            joy.buttons[8 + i] = active && (function ? down : array_at(source, "latched", wire, 0.0) > 0.5);
+            const double counter = array_at(source, "presses", wire, 0.0);
+            joy.buttons[16 + i] = std::isfinite(counter) && counter >= 0.0 && counter <= INT32_MAX
+                ? static_cast<int32_t>(counter) : 0;
+            const double value = array_at(source, "values", wire, down ? 1.0 : 0.0);
+            joy.axes[i] = active && down && std::isfinite(value) ? std::clamp(value, 0.0, 1.0) : 0.0;
         }
+        buttons_pub_->publish(joy);
+        std_msgs::msg::String peer;
+        peer.data = json{{"host", client_ip}, {"stream_id", stream}, {"sequence", sequence}}.dump();
+        peer_pub_->publish(peer);
 
         // "opening" is absent whenever the marker estimate is invalid.
-        if (active && j.contains("gripper")) {
+        if (tracking_ok && j.contains("gripper")) {
             const auto& g = j["gripper"];
             if (get_json_value<bool>(g, "valid", false) && g.contains("opening") && g["opening"].is_number()) {
                 std_msgs::msg::Float64 opening;
@@ -475,33 +512,59 @@ class OSCNode : public rclcpp::Node {
         }
     }
 
-    // Joy axes [left x, left y, right x, right y]: unit disc, x right and y up,
-    // centred while inactive. Invalid sticks publish nothing, so the
-    // receiver's freshness timeout stops the robot.
-    void publish_gamepad(const json& j, bool active, rclcpp::Time stamp) {
+    // Raw Gamepad: sticks, layout marker, four analog functions; digital
+    // D-pad/ABXY, four function states, L3/R3. Keep robot semantics downstream.
+    bool publish_gamepad(const json& j, bool active, rclcpp::Time stamp) {
         sensor_msgs::msg::Joy joy;
-        joy.header.stamp    = stamp;
+        joy.header.stamp = stamp;
         joy.header.frame_id = frame_id_;
-        joy.axes.assign(4, 0.0f);
+        joy.axes.assign(9, 0.0f);
+        joy.buttons.assign(14, 0);
+        if (!j.contains("gamepad") || !j["gamepad"].is_object()) return false;
+        const auto& g = j["gamepad"];
+        const auto layout = get_json_value<std::string>(g, "layout", "");
+        if (!layout.empty() && layout != "steering") return false;
+        const bool steering = layout == "steering";
+        joy.axes[4] = steering ? 1.0f : 0.0f;
         if (active) {
-            if (!j.contains("gamepad") || !j["gamepad"].is_object()) return;
-            const auto& g = j["gamepad"];
             const char* sticks[] = {"left", "right"};
             for (size_t s = 0; s < 2; ++s) {
-                if (!g.contains(sticks[s]) || !g[sticks[s]].is_object()) return;
+                if (!g.contains(sticks[s]) || !g[sticks[s]].is_object()) return false;
                 const auto& stick = g[sticks[s]];
                 const double x = get_json_value<double>(stick, "x", NAN);
                 const double y = get_json_value<double>(stick, "y", NAN);
-                if (!std::isfinite(x) || !std::isfinite(y) || std::hypot(x, y) > 1.0 + 1e-3) {
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                                         "Ignoring gamepad packet with invalid %s stick", sticks[s]);
-                    return;
-                }
-                joy.axes[2 * s]     = static_cast<float>(x);
+                const bool down = get_json_value<bool>(stick, "active", false);
+                const bool click = get_json_value<bool>(stick, "click", false);
+                if (!std::isfinite(x) || !std::isfinite(y) ||
+                    (steering && s == 1 ? (x < 0 || x > 1 || y < 0 || y > 1)
+                                       : std::hypot(x, y) > 1.0 + 1e-3) ||
+                    (!down && (x != 0 || y != 0 || click))) return false;
+                joy.axes[2 * s] = static_cast<float>(x);
                 joy.axes[2 * s + 1] = static_cast<float>(y);
+                joy.buttons[12 + s] = click;
+            }
+            if (g.contains("functions")) {
+                const auto& f = g["functions"];
+                if (!f.is_object() || !f.contains("states") || !f["states"].is_array() || f["states"].size() != 4 ||
+                    !f.contains("presses") || !f["presses"].is_array() || f["presses"].size() != 4) return false;
+                if (f.contains("values") && (!f["values"].is_array() || f["values"].size() != 4)) return false;
+                for (size_t i = 0; i < 4; ++i) {
+                    if (!f["states"][i].is_boolean() || !f["presses"][i].is_number_unsigned()) return false;
+                    const bool down = f["states"][i].get<bool>();
+                    const double value = f.contains("values") && f["values"][i].is_number()
+                        ? f["values"][i].get<double>() : f.contains("values") ? NAN : (down ? 1.0 : 0.0);
+                    if (!std::isfinite(value) || value < 0 || value > 1 || (!down && value != 0)) return false;
+                    joy.buttons[8 + i] = down;
+                    joy.axes[5 + i] = value;
+                }
+            }
+            if (j.contains("buttons") && j["buttons"].is_object()) {
+                for (size_t i = 0; i < 8; ++i)
+                    joy.buttons[i] = get_json_value<bool>(j["buttons"], "button" + std::to_string(i + 1), false);
             }
         }
         gamepad_pub_->publish(joy);
+        return true;
     }
 
     void process_osc_message(const char* data, size_t size) {
@@ -889,6 +952,8 @@ class OSCNode : public rclcpp::Node {
     rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr              gamepad_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                tracking_ok_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr             gripper_opening_pub_;
+
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr peer_pub_;
 
     // TF broadcaster
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;

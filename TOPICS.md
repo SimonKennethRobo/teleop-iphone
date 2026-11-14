@@ -1,6 +1,6 @@
 # ROS2 Topics
 
-For Go2-X5 OCS2 teleoperation, the package consumes `/go2_x5/ee/state` (`ocs2_msgs/msg/MpcObservation`) and publishes `/go2_x5/ee/goal` (`geometry_msgs/msg/PoseStamped`) plus `/mobile_manipulator_mpc_target` (`ocs2_msgs/msg/MpcTargetTrajectories`). Phone buttons f2/f7/f8 publish `HOME`/`OCS2`/`WBC` to `/go2_x5/arm/mode/request`; see `config/teleop_iphone.yaml` for the f1-f8 mapping. The planner-facing goal remains available when `go2_x5_planning` is running; OCS2 remains the joint-command owner.
+For Go2-X5 OCS2 teleoperation, the package consumes `/go2_x5/ee/state` (`ocs2_msgs/msg/MpcObservation`) and publishes `/go2_x5/ee/goal` (`geometry_msgs/msg/PoseStamped`) plus `/mobile_manipulator_mpc_target` (`ocs2_msgs/msg/MpcTargetTrajectories`). Phone buttons B/X/Y publish `HOME`/`OCS2`/`WBC` to `/go2_x5/arm/mode/request`; see `config/teleop_iphone.yaml` for the A/B/X/Y/F1–F4 mapping. The planner-facing goal remains available when `go2_x5_planning` is running; OCS2 remains the joint-command owner.
 
 Complete list of all published topics and their message types.
 
@@ -18,14 +18,16 @@ Complete list of all published topics and their message types.
 | `/iphone/compass_heading` | `std_msgs/Float64`             | ~60Hz | Compass heading (degrees, 0-360)                   |
 | `/go2_x5/ee/goal`         | `geometry_msgs/PoseStamped`    | ~50Hz | World-frame teleop EE goal for the planner         |
 | `/mobile_manipulator_mpc_target` | `ocs2_msgs/MpcTargetTrajectories` | ~50Hz | Native OCS2 EE target |
-| `/go2_x5/arm/mode/request` | `std_msgs/String`              | Event | f2/f7/f8 tap `HOME`/`OCS2`/`WBC` mode request     |
-| `/go2_x5/arm/gripper/command` | `std_msgs/Float64`         | Event | Gripper width (m) from the filtered phone gripper opening |
+| `/go2_x5/arm/mode/request` | `std_msgs/String`              | Event | B/X/Y tap `HOME`/`OCS2`/`WBC` mode request     |
+| `/go2_x5/arm/gripper/command` | `std_msgs/Float64`         | Event | Gripper width (m) from F1 percentage; optional explicit marker source |
 | `/iphone/touch`           | `geometry_msgs/PoseArray`      | ~40Hz | One pose per finger (primary touch x/y)            |
-| `/iphone/buttons`         | `sensor_msgs/Joy`              | ~40Hz | 3D mode only. N=8: `buttons[i]` pressed, `buttons[N+i]` latched, `buttons[2N+i]` press count, `axes[i]` slider value 0-1 |
-| `/iphone/gamepad`         | `sensor_msgs/Joy`              | ~60Hz | Gamepad mode only. `axes` = [left x, left y, right x, right y], unit disc, x right / y up; zero while inactive |
-| `/go2_x5/base/cmd_vel`    | `geometry_msgs/Twist`          | ~60Hz | Gamepad base velocity for rl_sar: left stick -> `linear.x/y`, right stick x -> `angular.z` |
-| `/iphone/tracking_ok`     | `std_msgs/Bool`                | ~40Hz | `active && poseValid && tracking == "normal"`      |
+| `/iphone/buttons`         | `sensor_msgs/Joy`              | ~40Hz | Both modes, canonical A/B/X/Y/F1/F2/F3/F4. N=8: pressed / latched / counters in first 24 `buttons`; `axes[i]` value 0–1. Extra flags: [24] active, [25] stream/mode changed, [26] AR. Header frame_id identifies phone/mode/stream for counter resets |
+| `/iphone/gamepad`         | `sensor_msgs/Joy`              | ~60Hz | Raw Gamepad: `axes` = [left x, left y, right x, right y, steering-layout flag, F1…F4 values]. `buttons` = [Up,Down,Left,Right,A,B,X,Y,F1…F4,L3,R3]. Sticks unit disc; steering right pair = independent LT/RT in [0,1]. Controls neutral while inactive |
+| `/go2_x5/base/cmd_vel`    | `geometry_msgs/Twist`          | ~60Hz | Gamepad base velocity: sticks -> x/y/yaw; steering -> RT×(1−LT) forward, left.x yaw; F4 precision |
+| `/iphone/tracking_ok`     | `std_msgs/Bool`                | ~40Hz | `AR && active && poseValid && tracking == "normal"`      |
 | `/iphone/gripper/opening` | `std_msgs/Float64`             | ~14Hz | Marker gripper opening 0 (closed) - 1 (open), only while valid |
+| `/iphone/peer` | `std_msgs/String` | ~60Hz | Accepted EmbodiLab sender IPv4, stream ID and sequence JSON; feedback auto-destination and reception acknowledgement |
+| `/teleop_iphone/robot_state` | `std_msgs/String` | 5Hz + events | Structured teleop status consumed by robot_state_feedback.py |
 | `/teleop_iphone/status`   | `std_msgs/String`              | 5Hz   | Effective scales, axis lock, precision, yaw, gripper |
 | `/teleop_iphone/status_marker` | `visualization_msgs/Marker` | 5Hz  | RViz text above the EE                             |
 
@@ -224,3 +226,14 @@ ros2 node info /osc_node
 # Enable debug logging
 ros2 run teleop_iphone osc_node --ros-args --log-level debug
 ```
+
+
+## Robot JSON feedback inputs
+
+The display-only feedback bridge subscribes to `/arx5_controller/gripper_state`
+(`std_msgs/Float64`, width in metres) and `/go2_x5/slam/odom`
+(`nav_msgs/Odometry`, measured body twist). Optional battery, temperature and
+robot-specific diagnostics topics are configured in
+`config/robot_state_feedback.yaml`. It sends full UDP JSON snapshots to the
+current iPhone on port 5567; see [README.md](README.md#robot-feedback-to-iphone)
+for freshness, units, source semantics and launch arguments.

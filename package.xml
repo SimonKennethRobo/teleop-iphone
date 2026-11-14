@@ -3,13 +3,14 @@
 <package format="3">
   <name>teleop_iphone</name>
   <version>1.0.0</version>
-  <description>ZigSim Pro iPhone teleoperation of Go2-X5 OCS2 end-effector targets</description>
+  <description>EmbodiLab iPhone teleoperation of Go2-X5 end-effector targets and base velocity</description>
   <maintainer email="user@todo.todo">Simon</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>nlohmann_json</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
@@ -19,11 +20,14 @@
   <depend>ocs2_msgs</depend>
   <depend>visualization_msgs</depend>
 
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rviz2</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>rclpy</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

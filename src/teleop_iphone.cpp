@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -73,17 +75,20 @@ class TeleopIphone : public rclcpp::Node {
     rotation_scale_ = declare_parameter<double>("rotation_scale", 0.6);
     scale_range_ = declare_parameter<double>("scale_slider_range", 3.0);
     precision_factor_ = declare_parameter<double>("precision_factor", 0.3);
-    align_hold_time_ = positive_parameter("align_hold_time", 0.6);
     align_reference_frame_ = declare_parameter<std::string>("align_reference_frame", "");
-    // Buttons are 1-based to match the phone labels f1..f8.
-    position_scale_button_ = button_parameter("position_scale_button", 1);
+    // Canonical 1-based slots: A/B/X/Y/F1/F2/F3/F4.
+    position_scale_button_ = button_parameter("position_scale_button", 6);
+    gripper_button_ = button_parameter("gripper_button", 5);
+    gripper_source_ = declare_parameter<std::string>("gripper_control_source", "button");
+    if (gripper_source_ != "button" && gripper_source_ != "marker")
+      throw std::invalid_argument("gripper_control_source must be button or marker");
     home_button_ = button_parameter("home_button", 2);
-    axis_lock_button_ = button_parameter("axis_lock_button", 3);
-    rotation_scale_button_ = button_parameter("rotation_scale_button", 4);
-    precision_button_ = button_parameter("precision_button", 5);
-    align_button_ = button_parameter("align_button", 6);
-    ocs2_button_ = button_parameter("ocs2_button", 7);
-    wbc_button_ = button_parameter("wbc_button", 8);
+    axis_lock_button_ = button_parameter("axis_lock_button", 7);
+    rotation_scale_button_ = button_parameter("rotation_scale_button", 0, true);
+    precision_button_ = button_parameter("precision_button", 8, true);
+    align_button_ = button_parameter("align_button", 1);
+    ocs2_button_ = button_parameter("ocs2_button", 3);
+    wbc_button_ = button_parameter("wbc_button", 4);
     phone_yaw_ = declare_parameter<double>("phone_to_world_yaw", 1.5707963267948966);
     const double rate = positive_parameter("control_rate", 50.0);
     if (!std::isfinite(clutch_delay_) || clutch_delay_ < 0.0 ||
@@ -104,6 +109,8 @@ class TeleopIphone : public rclcpp::Node {
     mode_request_pub_ = create_publisher<std_msgs::msg::String>(mode_request_topic, rclcpp::QoS(10));
     gripper_pub_ = create_publisher<std_msgs::msg::Float64>(gripper_topic, rclcpp::QoS(10));
     status_pub_ = create_publisher<std_msgs::msg::String>(status_topic, rclcpp::QoS(1));
+    robot_state_pub_ = create_publisher<std_msgs::msg::String>(
+        declare_parameter<std::string>("robot_state_topic", "/teleop_iphone/robot_state"), rclcpp::QoS(1));
     marker_pub_ = create_publisher<visualization_msgs::msg::Marker>(marker_topic, rclcpp::QoS(1));
     touch_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
         touch_topic, rclcpp::SensorDataQoS().keep_last(1),
@@ -169,16 +176,18 @@ class TeleopIphone : public rclcpp::Node {
           }
           if (msg->data != mode_) RCLCPP_INFO(get_logger(), "Arm mode is %s", msg->data.c_str());
           mode_ = msg->data;
+          last_mode_ = Clock::now();
+          publish_robot_state();
         });
     timer_ = create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(1.0 / rate)),
         [this]() { control(); });
-    status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() { publish_status(); });
+    status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() { publish_status(); publish_robot_state(); });
 
     // Gamepad mode: left stick drives forward/lateral velocity, right stick
     // x the yaw rate (Unitree remote layout). rl_sar ignores commands older
     // than its own timeout; this node also sends one zero when the phone
-    // stream stops. ABXY and the D-pad are not mapped.
+    // stream stops. ABXY use the configured actions; D-pad is display-only.
     const auto gamepad_topic = declare_parameter<std::string>("gamepad_topic", "/iphone/gamepad");
     const auto base_velocity_topic = declare_parameter<std::string>("base_velocity_topic", "/go2_x5/base/cmd_vel");
     gamepad_timeout_ = positive_parameter("gamepad_timeout", 0.2);
@@ -193,6 +202,7 @@ class TeleopIphone : public rclcpp::Node {
       if (gamepad_driving_ && std::chrono::duration<double>(Clock::now() - last_gamepad_).count() > gamepad_timeout_) {
         base_velocity_pub_->publish(geometry_msgs::msg::Twist());
         gamepad_driving_ = false;
+        base_command_ = geometry_msgs::msg::Twist();
         RCLCPP_WARN(get_logger(), "Gamepad stream stopped; base velocity zeroed");
       }
     });
@@ -211,8 +221,9 @@ class TeleopIphone : public rclcpp::Node {
     return value;
   }
 
-  size_t button_parameter(const std::string& name, int default_value) {
+  size_t button_parameter(const std::string& name, int default_value, bool allow_disabled = false) {
     const auto value = declare_parameter<int>(name, default_value);
+    if (allow_disabled && value == 0) return kMaxButtons;
     if (value < 1 || value > static_cast<int>(kMaxButtons)) {
       throw std::invalid_argument(name + " must be in [1, 8]");
     }
@@ -236,6 +247,7 @@ class TeleopIphone : public rclcpp::Node {
         RCLCPP_WARN(get_logger(), "Tracking interrupted: %s", reason);
       }
     }
+    reason_ = reason;
     pressing_ = false;
     release_required_ = true;
   }
@@ -244,12 +256,25 @@ class TeleopIphone : public rclcpp::Node {
   // buttons[2N+i] press counter, axes[i] slider value in [0, 1].
   void on_buttons(const sensor_msgs::msg::Joy& msg) {
     const size_t n = std::min(msg.axes.size(), kMaxButtons);
-    if (msg.buttons.size() < 3 * msg.axes.size()) return;
+    if (msg.axes.size() != kMaxButtons || msg.buttons.size() < 3 * kMaxButtons) return;
+    if (msg.header.frame_id != buttons_source_ ||
+        (msg.buttons.size() > 25 && msg.buttons[25]) ||
+        (have_buttons_ && std::chrono::duration<double>(Clock::now() - last_buttons_).count() > touch_timeout_)) {
+      have_buttons_ = false;
+      align_pending_ = false;
+    }
+    buttons_source_ = msg.header.frame_id;
+    const bool active = msg.buttons.size() <= 24 || msg.buttons[24] != 0;
+    input_active_ = active;
+    control_mode_ = msg.buttons.size() > 26 && !msg.buttons[26] ? "gamepad" : "arkit";
+    if (!active) align_pending_ = false;
+    last_buttons_ = Clock::now();
     const auto wall = Clock::now();
     const size_t stride = msg.axes.size();
     for (size_t i = 0; i < n; ++i) {
-      pressed_[i] = msg.buttons[i] != 0;
-      latched_[i] = msg.buttons[stride + i] != 0;
+      const bool was_pressed = pressed_[i];
+      pressed_[i] = active && msg.buttons[i] != 0;
+      latched_[i] = active && msg.buttons[stride + i] != 0;
       const double value =
           std::isfinite(msg.axes[i]) ? std::clamp(static_cast<double>(msg.axes[i]), 0.0, 1.0) : 0.5;
       // A finger dragging a latched slider is not a clutch finger.
@@ -259,26 +284,24 @@ class TeleopIphone : public rclcpp::Node {
       values_[i] = value;
       const int presses = msg.buttons[2 * stride + i];
       // Counters restart with each phone stream; only an increase is a tap.
-      const bool tapped = have_buttons_ && presses > presses_[i];
+      const bool tapped = active && have_buttons_ && presses > presses_[i];
       presses_[i] = presses;
+      if (i == align_button_ && active && (msg.buttons.size() <= 26 || msg.buttons[26]) &&
+          (tapped || (pressed_[i] && (!have_buttons_ || !was_pressed)))) {
+        align_pending_ = true;
+      }
       if (tapped && i == home_button_) request_home();
       if (tapped && i == ocs2_button_) request_mode(ocs2_button_, "OCS2");
       if (tapped && i == wbc_button_) request_mode(wbc_button_, "WBC");
     }
     for (size_t i = n; i < kMaxButtons; ++i) pressed_[i] = latched_[i] = false;
-    have_buttons_ = true;
-
-    if (pressed_[align_button_]) {
-      if (!align_holding_) align_since_ = wall;
-      align_holding_ = true;
-      if (!align_done_ && std::chrono::duration<double>(wall - align_since_).count() >= align_hold_time_) {
-        align_pending_ = true;
-        align_done_ = true;
-        std::cout<<"heading align done"<<std::endl;
-      }
-    } else {
-      align_holding_ = align_done_ = false;
+    have_buttons_ = active;
+    // Manual F1 commands are independent of AR tracking and marker estimates.
+    // Released/inactive controls hold the last width instead of closing it.
+    if (gripper_source_ == "button" && pressed_[gripper_button_]) {
+      publish_gripper_width(values_[gripper_button_]);
     }
+
   }
 
   void on_gamepad(const sensor_msgs::msg::Joy& msg) {
@@ -286,10 +309,24 @@ class TeleopIphone : public rclcpp::Node {
     for (size_t i = 0; i < 4; ++i) {
       if (!std::isfinite(msg.axes[i])) return;
     }
+    const bool steering = msg.axes.size() > 4 && msg.axes[4] > 0.5;
+    // Raw Gamepad stores canonical ABXY/F1–F4 after its four D-pad slots.
+    const size_t precision_wire = precision_button_ + 4;
+    const bool precise_pressed = precision_button_ < kMaxButtons &&
+        (msg.buttons.size() > precision_wire ? msg.buttons[precision_wire] != 0 : precision());
+    const double precise = precise_pressed ? precision_factor_ : 1.0;
     geometry_msgs::msg::Twist velocity;
-    velocity.linear.x = std::clamp(static_cast<double>(msg.axes[1]), -1.0, 1.0) * max_linear_x_;
-    velocity.linear.y = -std::clamp(static_cast<double>(msg.axes[0]), -1.0, 1.0) * max_linear_y_;
-    velocity.angular.z = -std::clamp(static_cast<double>(msg.axes[2]), -1.0, 1.0) * max_yaw_rate_;
+    velocity.linear.x = std::clamp(static_cast<double>(msg.axes[1]), -1.0, 1.0) * max_linear_x_ * precise;
+    velocity.linear.y = -std::clamp(static_cast<double>(msg.axes[0]), -1.0, 1.0) * max_linear_y_ * precise;
+    velocity.angular.z = -std::clamp(static_cast<double>(msg.axes[2]), -1.0, 1.0) * max_yaw_rate_ * precise;
+    if (steering) {
+      // Independent LT brake / RT throttle; never interpret LT as yaw.
+      velocity.linear.x = std::clamp(static_cast<double>(msg.axes[3]), 0.0, 1.0) *
+          (1.0 - std::clamp(static_cast<double>(msg.axes[2]), 0.0, 1.0)) * max_linear_x_ * precise;
+      velocity.linear.y = 0.0;
+      velocity.angular.z = -std::clamp(static_cast<double>(msg.axes[0]), -1.0, 1.0) * max_yaw_rate_ * precise;
+    }
+    base_command_ = velocity;
     base_velocity_pub_->publish(velocity);
     last_gamepad_ = Clock::now();
     if (!gamepad_driving_) RCLCPP_INFO(get_logger(), "Gamepad driving the base on velocity topic");
@@ -304,21 +341,27 @@ class TeleopIphone : public rclcpp::Node {
                                           std::chrono::duration<double>(home_hold_time_));
     std_msgs::msg::String request;
     request.data = home_mode_;
+    requested_mode_ = home_mode_;
+    last_mode_request_ = Clock::now();
     mode_request_pub_->publish(request);
-    RCLCPP_WARN(get_logger(), "f%zu: requesting arm mode %s", home_button_ + 1, home_mode_.c_str());
+    publish_robot_state();
+    RCLCPP_WARN(get_logger(), "button slot %zu: requesting arm mode %s", home_button_ + 1, home_mode_.c_str());
   }
 
   // The mode-state callback disengages once the switch is reported, so
   // tracking re-anchors at the measured EE under the new controller.
   void request_mode(size_t button, const char* mode) {
     if (mode_ == mode) {
-      RCLCPP_INFO(get_logger(), "f%zu: arm mode is already %s", button + 1, mode);
+      RCLCPP_INFO(get_logger(), "button slot %zu: arm mode is already %s", button + 1, mode);
       return;
     }
     std_msgs::msg::String request;
     request.data = mode;
+    requested_mode_ = mode;
+    last_mode_request_ = Clock::now();
     mode_request_pub_->publish(request);
-    RCLCPP_WARN(get_logger(), "f%zu: requesting arm mode %s", button + 1, mode);
+    publish_robot_state();
+    RCLCPP_WARN(get_logger(), "button slot %zu: requesting arm mode %s", button + 1, mode);
   }
 
   // Fingers resting on unlatched buttons are part of touch.count but are not
@@ -330,10 +373,10 @@ class TeleopIphone : public rclcpp::Node {
     return touch_count_ > on_buttons ? touch_count_ - on_buttons : 0;
   }
 
-  // Latched slider: 50% keeps the base scale, 0%/100% divide/multiply it by
+  // Held or latched slider: 50% keeps the base scale, 0%/100% divide/multiply it by
   // scale_slider_range.
   double slider_factor(size_t button) const {
-    return latched_[button] ? std::pow(scale_range_, 2.0 * values_[button] - 1.0) : 1.0;
+    return button < kMaxButtons && pressed_[button] ? std::pow(scale_range_, 2.0 * values_[button] - 1.0) : 1.0;
   }
 
   enum class AxisLock { None, TranslationOnly, RotationOnly };
@@ -341,20 +384,21 @@ class TeleopIphone : public rclcpp::Node {
     if (!latched_[axis_lock_button_]) return AxisLock::None;
     return values_[axis_lock_button_] > 0.5 ? AxisLock::RotationOnly : AxisLock::TranslationOnly;
   }
-  bool precision() const { return pressed_[precision_button_]; }
+  bool precision() const { return precision_button_ < kMaxButtons && pressed_[precision_button_]; }
 
   void effective_scales(double& position_scale, double& rotation_scale) const {
     const double precise = precision() ? precision_factor_ : 1.0;
+    const double common = slider_factor(position_scale_button_) * precise;
+    const double rotation_trim = rotation_scale_button_ == position_scale_button_
+        ? 1.0 : slider_factor(rotation_scale_button_);
     const auto lock = axis_lock();
-    position_scale = lock == AxisLock::RotationOnly ? 0.0
-                                                    : position_scale_ * slider_factor(position_scale_button_) * precise;
+    position_scale = lock == AxisLock::RotationOnly ? 0.0 : position_scale_ * common;
     rotation_scale = lock == AxisLock::TranslationOnly
-                         ? 0.0
-                         : std::min(1.0, rotation_scale_ * slider_factor(rotation_scale_button_) * precise);
+        ? 0.0 : std::min(1.0, rotation_scale_ * common * rotation_trim);
   }
 
   void on_gripper_opening(double opening) {
-    if (!std::isfinite(opening)) return;
+    if (gripper_source_ != "marker" || !std::isfinite(opening)) return;
     opening = std::clamp(opening, 0.0, 1.0);
     // The marker estimate is ~14 Hz and noisy; while it is invalid osc_node
     // publishes nothing, so the last width is held.
@@ -363,7 +407,14 @@ class TeleopIphone : public rclcpp::Node {
                             : opening;
     if (mode_ != "OCS2" && mode_ != "WBC") return;
     if (!tracking_ok_) return;
-    const double width = gripper_closed_width_ + gripper_filtered_ * (gripper_open_width_ - gripper_closed_width_);
+    publish_gripper_width(gripper_filtered_);
+  }
+
+  void publish_gripper_width(double opening) {
+    if (mode_ != "OCS2" && mode_ != "WBC") return;
+    if (!std::isfinite(opening)) return;
+    const double width = gripper_closed_width_ + std::clamp(opening, 0.0, 1.0) *
+        (gripper_open_width_ - gripper_closed_width_);
     if (std::isfinite(gripper_sent_) && std::abs(width - gripper_sent_) < gripper_deadband_) return;
     std_msgs::msg::Float64 command;
     command.data = width;
@@ -379,9 +430,11 @@ class TeleopIphone : public rclcpp::Node {
       heading = tf2::quatRotate(phone_orientation, tf2::Vector3(0.0, 1.0, 0.0));
     }
     double reference_yaw = 0.0;
+    alignment_reference_ = goal_frame_;
     if (!align_reference_frame_.empty()) {
       try {
         const auto t = tf_buffer_->lookupTransform(goal_frame_, align_reference_frame_, tf2::TimePointZero);
+        alignment_reference_ = align_reference_frame_;
         const auto& q = t.transform.rotation;
         double roll, pitch;
         tf2::Matrix3x3(tf2::Quaternion(q.x, q.y, q.z, q.w)).getRPY(roll, pitch, reference_yaw);
@@ -392,7 +445,7 @@ class TeleopIphone : public rclcpp::Node {
     }
     phone_yaw_ = std::remainder(reference_yaw - std::atan2(heading.y(), heading.x()), 2.0 * M_PI);
     phone_to_world_.setRPY(0.0, 0.0, phone_yaw_);
-    RCLCPP_WARN(get_logger(), "f%zu: phone_to_world_yaw set to %.3f rad (%.1f deg)", align_button_ + 1, phone_yaw_,
+    RCLCPP_WARN(get_logger(), "button slot %zu: phone_to_world_yaw set to %.3f rad (%.1f deg)", align_button_ + 1, phone_yaw_,
                 phone_yaw_ * 180.0 / M_PI);
   }
 
@@ -411,6 +464,9 @@ class TeleopIphone : public rclcpp::Node {
       orientation.normalize();
       align_pending_ = false;
       align_heading(orientation);
+      ++alignment_count_;
+      last_alignment_ = Clock::now();
+      publish_robot_state();
       if (pressing_) reanchor_ = true;
     } catch (const tf2::TransformException& error) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Align waiting for iPhone pose: %s", error.what());
@@ -419,8 +475,19 @@ class TeleopIphone : public rclcpp::Node {
 
   void control() {
     const auto wall = Clock::now();
-    if (align_pending_) align_from_phone_tf();
+    if (have_buttons_ && std::chrono::duration<double>(wall - last_buttons_).count() > touch_timeout_) {
+      pressed_.fill(false);
+      latched_.fill(false);
+      have_buttons_ = false;
+      align_pending_ = false;
+    }
+    if (align_pending_ && tracking_ok_) align_from_phone_tf();
+    if (control_mode_ == "gamepad") {
+      disengage("Gamepad controls base; EE tracking disabled");
+      return;
+    }
     if (mode_.empty()) {
+      reason_ = "waiting for arm mode state";
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "Not publishing EE target: waiting for arm mode state");
       return;
@@ -465,6 +532,7 @@ class TeleopIphone : public rclcpp::Node {
     // With a touch clutch, the required release already covers HOME.
     if (!require_touch_clutch_ && wall < home_hold_until_) {
       pressing_ = false;
+      reason_ = "HOME hold";
       return;
     }
     if (require_touch_clutch_) {
@@ -474,6 +542,7 @@ class TeleopIphone : public rclcpp::Node {
         pressing_ = false;
         release_required_ = false;
         clutch_pending_ = false;
+        reason_ = "touch clutch released";
         return;
       }
       // Button taps briefly show up as a clutch finger before the button
@@ -482,8 +551,12 @@ class TeleopIphone : public rclcpp::Node {
         clutch_pending_ = true;
         clutch_since_ = wall;
       }
-      if (std::chrono::duration<double>(wall - clutch_since_).count() < clutch_delay_) return;
+      if (std::chrono::duration<double>(wall - clutch_since_).count() < clutch_delay_) {
+        reason_ = "waiting for touch clutch";
+        return;
+      }
       if (release_required_) {
+        reason_ = "release touch before re-clutching";
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                              "Not publishing EE target: release touch before re-clutching");
         return;
@@ -543,6 +616,9 @@ class TeleopIphone : public rclcpp::Node {
       disengage("invalid EE target");
       return;
     }
+    reason_ = "tracking";
+    last_target_ = wall;
+    have_target_ = true;
     target_position_ = position;
     target_orientation_ = orientation;
     geometry_msgs::msg::PoseStamped goal;
@@ -574,8 +650,60 @@ class TeleopIphone : public rclcpp::Node {
     mpc_target_pub_->publish(target);
   }
 
-  // The phone has no return channel, so expose the tuned state as a topic and
-  // an RViz text marker above the measured EE.
+  using Json = nlohmann::json;
+
+  Json age_ms(bool have, Clock::time_point stamp) const {
+    return have ? Json(std::chrono::duration<double, std::milli>(Clock::now() - stamp).count()) : Json(nullptr);
+  }
+
+  // Structured counterpart to the RViz text. Values describe this node's
+  // accepted inputs and commands, not confirmation of hardware execution.
+  void publish_robot_state() {
+    if (!robot_state_pub_) return;
+    const auto wall = Clock::now();
+    const bool stream_fresh = have_touch_ && std::chrono::duration<double>(wall - last_touch_).count() <= touch_timeout_;
+    const bool buttons_fresh = have_buttons_ && std::chrono::duration<double>(wall - last_buttons_).count() <= touch_timeout_;
+    const bool ee_fresh = have_ee_ && std::chrono::duration<double>(wall - last_ee_).count() <= ee_timeout_;
+    const bool following = control_mode_ == "arkit" && pressing_ && stream_fresh && buttons_fresh && input_active_ && tracking_ok_ && ee_fresh;
+    const bool base_fresh = gamepad_driving_ && std::chrono::duration<double>(wall - last_gamepad_).count() <= gamepad_timeout_;
+    const bool error_valid = following && have_target_ &&
+        std::chrono::duration<double>(wall - last_target_).count() <= pose_timeout_;
+    const auto lock = axis_lock();
+    double pos_scale, rot_scale;
+    effective_scales(pos_scale, rot_scale);
+    const std::string request_state = requested_mode_.empty() ? "none" : mode_ == requested_mode_ ? "matched" :
+        std::chrono::duration<double>(wall - last_mode_request_).count() > home_hold_time_ ? "unconfirmed" : "pending";
+    Json state = {
+      {"status", following ? "ee_tracking" : control_mode_ == "gamepad" && buttons_fresh && input_active_ ? "base_control" : "paused"},
+      {"mode", mode_.empty() ? Json(nullptr) : Json(mode_)},
+      {"mode_report_age_ms", age_ms(!mode_.empty(), last_mode_)},
+      {"mode_request", {{"requested", requested_mode_.empty() ? Json(nullptr) : Json(requested_mode_)},
+                         {"state", request_state}}},
+      {"teleop", {{"control_mode", control_mode_}, {"engaged", following},
+                 {"reason", !stream_fresh ? "iPhone stream timed out" : reason_},
+                 {"input_valid", stream_fresh && buttons_fresh && input_active_},
+                 {"input_age_ms", age_ms(have_touch_, last_touch_)},
+                 {"ee_valid", ee_fresh}, {"ee_age_ms", age_ms(last_ee_ != Clock::time_point{}, last_ee_)}}},
+      {"controls", {{"position_scale", pos_scale}, {"rotation_scale", rot_scale},
+                    {"precision", buttons_fresh && precision()},
+                    {"axis_lock", lock == AxisLock::None ? "none" : lock == AxisLock::RotationOnly ? "rotation" : "translation"}}},
+      {"alignment", {{"state", align_pending_ ? "pending" : alignment_count_ ? "aligned" : "not_aligned"},
+                     {"count", alignment_count_}, {"yaw_deg", phone_yaw_ * 180.0 / M_PI},
+                     {"reference", alignment_reference_}, {"age_ms", age_ms(alignment_count_ > 0, last_alignment_)}}},
+      {"gripper", {{"command_mm", std::isfinite(gripper_sent_) ? Json(gripper_sent_ * 1000.0) : Json(nullptr)}}},
+      {"ee_error", {{"valid", error_valid},
+                    {"position_mm", error_valid ? Json((target_position_ - ee_position_).length() * 1000.0) : Json(nullptr)},
+                    {"rotation_deg", error_valid ? Json(2.0 * std::acos(std::clamp(std::abs(target_orientation_.dot(ee_orientation_)), 0.0, 1.0)) * 180.0 / M_PI) : Json(nullptr)}}},
+      {"base", {{"command_mps_rps", {base_fresh ? base_command_.linear.x : 0.0,
+                                      base_fresh ? base_command_.linear.y : 0.0,
+                                      base_fresh ? base_command_.angular.z : 0.0}}}}
+    };
+    std_msgs::msg::String msg;
+    msg.data = state.dump();
+    robot_state_pub_->publish(msg);
+  }
+
+  // Keep the concise ROS/RViz status for existing operator tools.
   void publish_status() {
     double position_scale, rotation_scale;
     effective_scales(position_scale, rotation_scale);
@@ -616,9 +744,16 @@ class TeleopIphone : public rclcpp::Node {
     marker_pub_->publish(marker);
   }
 
+  std::string buttons_source_, gripper_source_;
+  std::string requested_mode_, control_mode_ = "arkit", reason_ = "waiting for iPhone input", alignment_reference_;
+  bool input_active_ = false, have_target_ = false;
+  uint64_t alignment_count_ = 0;
+  Clock::time_point last_mode_, last_mode_request_, last_alignment_, last_target_;
+  geometry_msgs::msg::Twist base_command_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_state_pub_;
   std::string iphone_source_frame_, iphone_target_frame_, goal_frame_, mode_, home_mode_, align_reference_frame_;
   double touch_timeout_, pose_timeout_, ee_timeout_, clutch_delay_, home_hold_time_, position_scale_, rotation_scale_;
-  double scale_range_, precision_factor_, align_hold_time_, phone_yaw_;
+  double scale_range_, precision_factor_, phone_yaw_;
   double gamepad_timeout_, max_linear_x_, max_linear_y_, max_yaw_rate_;
   bool gamepad_driving_ = false;
   Clock::time_point last_gamepad_;
@@ -626,7 +761,7 @@ class TeleopIphone : public rclcpp::Node {
   double gripper_filtered_ = NAN, gripper_sent_ = NAN;
   double active_position_scale_ = 0.0, active_rotation_scale_ = 0.0;
   size_t position_scale_button_, home_button_, axis_lock_button_, rotation_scale_button_;
-  size_t precision_button_, align_button_, ocs2_button_, wbc_button_;
+  size_t gripper_button_, precision_button_, align_button_, ocs2_button_, wbc_button_;
   std::array<bool, kMaxButtons> pressed_{}, latched_{};
   std::array<double, kMaxButtons> values_{};
   std::array<int, kMaxButtons> presses_{};
@@ -634,9 +769,9 @@ class TeleopIphone : public rclcpp::Node {
   int mpc_input_dim_ = 12;
   bool have_touch_ = false, have_ee_ = false, have_buttons_ = false, tracking_ok_ = false;
   bool require_touch_clutch_ = false, pressing_ = false, release_required_ = false, clutch_pending_ = false, reanchor_ = false;
-  bool align_holding_ = false, align_done_ = false, align_pending_ = false;
+  bool align_pending_ = false;
   size_t touch_count_ = 0;
-  Clock::time_point last_touch_, last_ee_, clutch_since_, align_since_, slider_active_until_, home_hold_until_;
+  Clock::time_point last_touch_, last_ee_, last_buttons_, clutch_since_, slider_active_until_, home_hold_until_;
   tf2::Vector3 ee_position_, start_phone_position_, start_ee_position_, target_position_;
   tf2::Quaternion ee_orientation_, start_phone_orientation_, start_ee_orientation_, target_orientation_;
   tf2::Quaternion phone_to_world_;

@@ -9,6 +9,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -22,4 +23,12 @@ def generate_launch_description():
     view = Node(package="rviz2", executable="rviz2", name="teleop_iphone_rviz", output="screen",
                 arguments=["-d", PathJoinSubstitution([share, "config", "default.rviz"])],
                 condition=IfCondition(LaunchConfiguration("rviz")))
-    return LaunchDescription([rviz, osc, teleop, view])
+    feedback_arg = DeclareLaunchArgument("feedback", default_value="true")
+    feedback_host_arg = DeclareLaunchArgument("feedback_host", default_value="")
+    feedback_node = Node(
+        package="teleop_iphone", executable="robot_state_feedback.py", name="robot_state_feedback",
+        output="screen", condition=IfCondition(LaunchConfiguration("feedback")),
+        parameters=[PathJoinSubstitution([share, "config", "robot_state_feedback.yaml"]),
+                    {"host": ParameterValue(LaunchConfiguration("feedback_host"), value_type=str)}],
+    )
+    return LaunchDescription([feedback_arg, feedback_host_arg, feedback_node, rviz, osc, teleop, view])

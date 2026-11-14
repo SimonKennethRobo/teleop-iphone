@@ -1,0 +1,20 @@
+robot_state_feedback:
+  ros__parameters:
+    robot_name: "go2-x5"
+    # Empty: learn the current phone IP from accepted EmbodiLab UDP controls.
+    # Set an explicit IPv4 address for feedback before controls start.
+    host: ""
+    port: 5567
+    rate: 5.0
+    peer_timeout: 30.0
+    teleop_timeout: 1.0
+    feedback_timeout: 0.5
+    health_timeout: 3.0
+    peer_topic: "/iphone/peer"
+    teleop_topic: "/teleop_iphone/robot_state"
+    gripper_state_topic: "/arx5_controller/gripper_state"
+    odom_topic: "/go2_x5/slam/odom"
+    # Optional standard ROS sources. Empty means unavailable, not healthy/zero.
+    battery_topic: ""       # sensor_msgs/BatteryState, percentage 0..1
+    diagnostics_topic: ""   # diagnostic_msgs/DiagnosticArray, robot-specific
+    temperature_topic: ""   # std_msgs/Float64, maximum drive temperature in C

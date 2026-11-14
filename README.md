@@ -2,7 +2,7 @@
 
 The ROS2 package is adapted for the Go2-X5 OCS2 stack: iPhone motion is converted into world-frame EE goals for OCS2, with an optional `go2_x5_planning` bridge. OCS2 remains the only joint-command producer. The legacy sensor receiver topics are still available for diagnostics.
 
-This repository contains tools for receiving ARKit and sensor data from ZigSim Pro iOS app:
+The main teleoperation path follows the current EmbodiLab iOS App. Legacy ZigSim Pro sensor receivers remain available:
 
 1. **Python UDP/JSON Receiver** - Simple standalone script for testing
 2. **ROS2 OSC Node** - Full ROS2 integration for robotics applications
@@ -219,24 +219,36 @@ zigsim_tele/
 
 ## Go2-X5 OCS2 teleoperation
 
-The ROS2 teleop node publishes end-effector goals for the existing Go2-X5 OCS2 graph. It does not publish joint, Cartesian-controller, gripper, or reset commands. It publishes both the planner-facing `PoseStamped` goal and the native OCS2 target topic, so the planner is optional for this teleop path.
+The ROS2 teleop node publishes world-frame end-effector goals, arm mode requests and percentage-controlled gripper width. It publishes both the planner-facing `PoseStamped` goal and the native OCS2 target, so the planner is optional. OCS2 remains the joint-command owner.
 
-Start the MPC graph first. The launch below also starts the existing reference manager, although teleop can publish the native target directly:
+Start the robot's MPC graph separately, then launch the receiver:
 
 ```bash
-# Terminal 1: start OCS2 and its EE reference manager.
-ros2 launch go2_x5_ocs2 go2_x5_ros_mpc.launch.py \
-  rviz:=false start_rviz:=false ee_reference_mode:=marker
-# Terminal 2: start the iPhone receiver and goal teleop node.
-ros2 launch teleop_iphone teleop.launch.py
+ros2 launch teleop_iphone teleop_go2_x5.launch.py
 ```
 
-Configure ZigSim Pro to send JSON/UDP to the host and port in `config/osc_params.yaml`. The receiver publishes the corrected phone pose as `iphone_odom -> iphone`. On a running OCS2/WBC mode, press one or two fingers to clutch the current EE pose, move the phone, and release to stop. Tracking continues with two fingers, which also open the gripper via `/go2_x5/arm/gripper/command`; going back to one finger closes it. Three fingers publish `HOME` to `/go2_x5/arm/mode/request`; the gesture fires once and rearms after all fingers are released.
+In EmbodiLab → Teleoperation, select **Wi-Fi / UDP**, the computer's LAN IP, and port **3333** (matching `config/osc_params.yaml`). TCP, USB and Bluetooth control transports are not connected by this ROS receiver. Select AR or Gamepad, then start sending; mode changes in the App require starting again.
+
+In AR, the transmit switch is the clutch by default: fresh tracked phone motion engages relative to the measured EE, and stopping, tracking loss or timeout disengages. Set `require_touch_clutch: true` to additionally require a finger outside controls. F1 percentage directly commands gripper width in either mode while the arm is in OCS2/WBC. Releasing F1 or stopping holds the last width. Marker estimates cannot override F1; set `gripper_control_source: marker` to explicitly restore the previous marker input. No finger-count HOME/gripper gestures are used.
+
+| Visible key | Default action | Canonical slot (1-based) |
+| --- | --- | --- |
+| A | Tap to align phone heading to robot `base` +x, AR only | 1 |
+| B | Request HOME | 2 |
+| X / Y | Request OCS2 / WBC | 3 / 4 |
+| F1 | Gripper opening: 0% closed, 100% configured maximum width | 5 |
+| F2 | Shared AR position and rotation scale | 6 |
+| F3 | AR axis lock: latched ≤50% translation only, >50% rotation only | 7 |
+| F4 | Precision: ×0.3 AR motion and Gamepad base velocity | 8 |
+
+F1/F2 work while held and retain their values when locked with the App's F1–F4 latch setting. F2 uses base scale × `3^(2*value-1)`: 50% is the base scale, 0% divides by three, 100% multiplies by three. F4 enables precision (×0.3) while pressed or latched; rotation scale is capped at one. F3 requires latch to enable axis lock. Changing scales reanchors the relative goal to avoid jumps. A aligns once per tap; F4 exclusively controls precision. Button indices in the YAML refer to the canonical slots above, not Gamepad wire order.
+
+Gamepad left stick controls base forward/lateral velocity; right stick X controls yaw rate. Xbox and PlayStation use the same wire channels. In Steering wheel layout, RT controls forward speed, LT reduces it to `RT × (1-LT)`, and steering controls yaw rate; lateral velocity is zero. Full brake stops forward motion and never requests reverse. D-pad and L3/R3 are published without robot actions. Gamepad F1 commands gripper width and F4 enables precision; F2/F3 values remain published on `/iphone/gamepad`; AR scale/lock/alignment controls do not alter Gamepad base motion. B/X/Y retain their arm mode requests in both modes. Inactive packets and returning to AR immediately publish zero base velocity; missing, invalid, duplicate or reordered packets do not refresh its 0.2 s watchdog.
 
 The data path is:
 
 ```text
-ZigSim Pro -> osc_node -> /iphone/touch + TF
+EmbodiLab JSON/UDP -> osc_node -> /iphone/buttons + /iphone/gamepad + TF
 teleop_iphone -> /go2_x5/ee/goal (geometry_msgs/PoseStamped)
 teleop_iphone -> /mobile_manipulator_mpc_target (ocs2_msgs/MpcTargetTrajectories)
 go2_x5_planning -> /mobile_manipulator_mpc_target (when the planner is running)
@@ -244,6 +256,63 @@ go2_x5_ocs2 -> /go2_x5/arm/command/request
 ```
 
 `goal_frame` defaults to `world`, matching the OCS2 floating-base model. Set `phone_to_world_yaw` in `config/teleop_iphone.yaml` when the phone's ARKit horizontal axes are rotated relative to the SLAM world. The teleop node requires fresh `/go2_x5/ee/state` feedback and an `OCS2` or `WBC` arm mode before publishing goals.
+
+
+## Robot feedback to iPhone
+
+The normal `teleop.launch.py` and `teleop_go2_x5.launch.py` now start a display-only
+`robot_state_feedback.py` bridge. In EmbodiLab Settings → **Robot state JSON**,
+keep port **5567**. Start sending controls once: `osc_node` learns the source
+phone's IPv4 address from accepted EmbodiLab packets, and the bridge returns
+complete JSON snapshots over UDP at 5 Hz. The source UDP port is not reused.
+After controls stop, feedback continues for up to 30 seconds; a silent peer then
+expires. No address is guessed or broadcast before a phone has sent controls.
+
+```bash
+# Normal operation: automatic phone address, existing robot graph running separately.
+ros2 launch teleop_iphone teleop_go2_x5.launch.py
+# Fixed destination, including feedback before the phone starts sending controls.
+ros2 launch teleop_iphone teleop_go2_x5.launch.py feedback_host:=192.168.1.20
+# Disable feedback when desired.
+ros2 launch teleop_iphone teleop_go2_x5.launch.py feedback:=false
+```
+
+Configuration: `config/robot_state_feedback.yaml`. The launch argument
+`feedback_host` overrides its `host`; both default to empty (auto). The bridge can
+also run independently with that YAML and an explicit `host` parameter.
+
+| Phone fields | Meaning / source |
+| --- | --- |
+| `mode`, `mode_report_age_ms`, `mode_request` | Reported arm mode and its age; requested mode is separately pending/matched/unconfirmed. Mode state is latched, so its receipt age alone is not a hardware heartbeat. |
+| `teleop` | Actual EE command engagement, pause reason, accepted-input and EE-feedback freshness. `engaged` does not mean motors are enabled. |
+| `controls`, `alignment` | Effective F2 scale, F3 lock, F4 precision; A alignment result/count, yaw and actual reference frame (including world fallback). |
+| `gripper.command_mm`, `gripper.measured_mm` | Sent command versus measured driver width from `/arx5_controller/gripper_state`. `gripper.valid` applies to the measurement. |
+| `ee_error` | Distance in mm and shortest quaternion angle in degrees between this node's latest EE goal and measured `/go2_x5/ee/state`, only while fresh and following. |
+| `base.command_mps_rps`, `base.measured_mps_rps` | [vx, vy, wz] command versus odometry twist from `/go2_x5/slam/odom`; `base.frame` identifies the measured twist frame. `base.valid` applies to the measurement. |
+| `input_ack` | Latest packet stream/sequence accepted by the UDP receiver; confirms reception, not actuator execution or round-trip latency. |
+| `battery`, `temperature`, `fault` | Optional standard ROS sources; unavailable until explicitly configured. No fault feedback is not a clean bill of health. |
+
+Optional sources are `sensor_msgs/BatteryState` (percentage 0–1),
+`std_msgs/Float64` (maximum drive temperature in °C), and a robot-specific
+`diagnostic_msgs/DiagnosticArray`. The native Unitree low-state format is not
+implicitly decoded. Configure/remap the standard topics supplied by your robot.
+Diagnostic changes trigger an additional full snapshot. `fault.summary: "OK"`
+means the configured diagnostics source reported all OK; absent/stale diagnostics
+remain `valid: false` with a null summary.
+
+Every measurement includes `valid` and `age_ms` (time since receipt). Stamped
+odometry/battery/diagnostics additionally check source timestamps against the ROS
+clock and expose `source_age_ms`; zero, future or stale timestamps are invalid.
+Unstamped gripper/temperature inputs can only be checked by receipt time. Use the
+same ROS clock across publishers. Fast feedback expires after 0.5 s; health
+feedback after 3 s. Invalid/stale measurements become JSON `null`, not zero.
+The bridge clears teleop commands/engagement if structured teleop status stops
+for 1 s, even while the App continues to label the incoming bridge packets LIVE.
+Snapshots fit within the App's 64-field and 32 KiB limits. Full-rate data remains
+in ROS/logs rather than the phone monitor.
+
+The implementation is covered by synthetic ROS → UDP loopback tests. Phone
+screen delivery and real hardware behavior require a separate live check.
 
 
 ## License
